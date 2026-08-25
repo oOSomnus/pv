@@ -34,6 +34,22 @@ pub trait Interaction {
     /// Reads a hidden password or returns a renderer-neutral navigation action.
     fn password(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError>;
 
+    /// Reads a hidden password, applying `default` when the submitted value is empty.
+    fn password_with_default(
+        &mut self,
+        prompt: &str,
+        default: &str,
+    ) -> Result<InteractionResult<String>, InteractionError> {
+        match self.password(prompt)? {
+            InteractionResult::Value(value) if value.is_empty() => {
+                Ok(InteractionResult::Value(default.to_owned()))
+            }
+            InteractionResult::Value(value) => Ok(InteractionResult::Value(value)),
+            InteractionResult::Back => Ok(InteractionResult::Back),
+            InteractionResult::Cancel => Ok(InteractionResult::Cancel),
+        }
+    }
+
     /// Reads visible text or returns a renderer-neutral navigation action.
     fn input(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError>;
 
@@ -236,6 +252,47 @@ pub struct App<I> {
     interaction: I,
 }
 
+/// Stores manual Add fields until the user explicitly saves the Credential.
+#[derive(Default)]
+struct CredentialDraft {
+    /// The website or service identifier entered for the pending Credential.
+    key: String,
+    /// The login identity entered for the pending Credential.
+    name: String,
+    /// The opaque secret entered for the pending Credential.
+    value: String,
+}
+
+/// Identifies the current step in the manual Credential Draft workflow.
+enum ManualDraftStep {
+    /// Collects or edits the pending Credential Key.
+    Key,
+    /// Collects or edits the pending Credential Name.
+    Name,
+    /// Collects or edits the pending opaque Credential Value.
+    Value,
+    /// Presents the pending Credential for a save decision.
+    Review,
+}
+
+/// Describes how the manual Draft workflow should return to its parent.
+enum ManualDraftOutcome {
+    /// Returns from the Key step to the Add value-type selection.
+    BackToValueType,
+    /// Completes the Add interaction, whether by Save or Cancel.
+    Completed,
+}
+
+/// Describes the result of the shared duplicate-aware Credential save operation.
+enum CredentialSaveOutcome {
+    /// The Credential was upserted and persisted successfully.
+    Saved,
+    /// The user returned to the pending Credential without changing the Vault.
+    Back,
+    /// The user cancelled the save without changing the Vault.
+    Cancelled,
+}
+
 /// Describes how an open Vault session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenResult {
@@ -245,13 +302,83 @@ pub enum OpenResult {
     Cancelled,
 }
 
+/// Describes a credential resolved through exact lookup or fuzzy selection.
+#[derive(Debug)]
+enum CredentialResolution<'vault> {
+    /// The Key matched a Credential entry exactly after normalization.
+    Exact(&'vault Credential),
+    /// A fuzzy candidate was selected and its candidate list is retained for Back navigation.
+    Fuzzy {
+        /// The Credential entry selected by the user.
+        credential: &'vault Credential,
+        /// The fuzzy candidates displayed before the selection.
+        candidates: Vec<&'vault Credential>,
+    },
+}
+
 /// Identifies the immediate parent to which a Get detail page returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GetDetailParent {
-    /// The Key lookup page that starts Get.
+#[derive(Debug)]
+enum GetDetailParent<'vault> {
+    /// Returns to the initial Key lookup page.
     KeyLookup,
-    /// The fuzzy suggestion page and its original query.
-    Suggestions(String),
+    /// Returns to the retained fuzzy candidate selection page.
+    Suggestions(Vec<&'vault Credential>),
+}
+
+/// Copies the non-secret context shown while confirming Credential entry removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemovalCandidate {
+    /// The Key identifying the Credential entry.
+    key: String,
+    /// The Name associated with the Credential entry.
+    name: String,
+}
+
+impl RemovalCandidate {
+    /// Copies the removable context without retaining or exposing the Value.
+    fn from_credential(credential: &Credential) -> Self {
+        Self {
+            key: credential.key().to_owned(),
+            name: credential.name().to_owned(),
+        }
+    }
+}
+
+/// Identifies the Remove step to revisit when the user presses Back.
+#[derive(Debug)]
+enum RemovalParent {
+    /// Returns to the Key lookup step.
+    Lookup,
+    /// Returns to a previously displayed fuzzy candidate selection.
+    CandidateSelection {
+        /// The fuzzy candidates to display again.
+        candidates: Vec<RemovalCandidate>,
+    },
+}
+
+/// Holds a selected Credential entry and its immediate Back destination.
+#[derive(Debug)]
+struct RemovalConfirmation {
+    /// The Credential entry selected for removal.
+    candidate: RemovalCandidate,
+    /// The step to revisit when this confirmation receives Back.
+    parent: RemovalParent,
+}
+
+/// Represents the current reversible Remove workflow step.
+#[derive(Debug)]
+enum RemovalStep {
+    /// Requests an exact or fuzzy Key.
+    Lookup,
+    /// Displays fuzzy candidates for selection.
+    CandidateSelection {
+        /// The candidates available for selection.
+        candidates: Vec<RemovalCandidate>,
+    },
+    /// Shows the first independent deletion confirmation.
+    FirstConfirmation(RemovalConfirmation),
+    /// Shows the second independent deletion confirmation.
+    SecondConfirmation(RemovalConfirmation),
 }
 
 impl<I: Interaction> App<I> {
@@ -370,7 +497,7 @@ impl<I: Interaction> App<I> {
                 .choose("Vault", &["Add", "Get", "Remove", "Exit"])?;
             match choice {
                 InteractionResult::Value(0) => self.add_credential(path, vault)?,
-                InteractionResult::Value(1) => self.get_key_lookup(vault)?,
+                InteractionResult::Value(1) => self.get_credential(vault)?,
                 InteractionResult::Value(2) => self.remove_credential(path, vault)?,
                 InteractionResult::Value(3)
                 | InteractionResult::Back
@@ -385,93 +512,174 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Resolves an exact normalized Key or fuzzy candidate, confirms removal twice, and persists the changed Vault.
+    /// Resolves a Key, navigates reversible removal confirmations, and persists only on success.
     fn remove_credential(&mut self, path: &Path, vault: &mut Vault) -> Result<(), AppError> {
-        let Some(credential) = self.resolve_credential(vault)? else {
-            return Ok(());
-        };
-        let key = credential.key().to_owned();
-        let name = credential.name().to_owned();
-
-        self.interaction
-            .message(&format!("Key: {key}\nName: {name}"))?;
-        if !self.confirm_removal("Remove Credential entry", "Confirm")? {
-            return Ok(());
+        let mut step = RemovalStep::Lookup;
+        loop {
+            step = match step {
+                RemovalStep::Lookup => match self.resolve_credential(vault)? {
+                    None => return Ok(()),
+                    Some(CredentialResolution::Exact(credential)) => {
+                        RemovalStep::FirstConfirmation(RemovalConfirmation {
+                            candidate: RemovalCandidate::from_credential(credential),
+                            parent: RemovalParent::Lookup,
+                        })
+                    }
+                    Some(CredentialResolution::Fuzzy {
+                        credential,
+                        candidates,
+                    }) => RemovalStep::FirstConfirmation(RemovalConfirmation {
+                        candidate: RemovalCandidate::from_credential(credential),
+                        parent: RemovalParent::CandidateSelection {
+                            candidates: candidates
+                                .iter()
+                                .map(|candidate| RemovalCandidate::from_credential(candidate))
+                                .collect(),
+                        },
+                    }),
+                },
+                RemovalStep::CandidateSelection { candidates } => {
+                    match self.choose_removal_candidate(&candidates)? {
+                        InteractionResult::Value(choice) => {
+                            RemovalStep::FirstConfirmation(RemovalConfirmation {
+                                candidate: candidates[choice].clone(),
+                                parent: RemovalParent::CandidateSelection { candidates },
+                            })
+                        }
+                        InteractionResult::Back => RemovalStep::Lookup,
+                        InteractionResult::Cancel => return Ok(()),
+                    }
+                }
+                RemovalStep::FirstConfirmation(RemovalConfirmation { candidate, parent }) => {
+                    self.show_removal_candidate(&candidate)?;
+                    match self.confirm_removal("Remove Credential entry", "Confirm")? {
+                        InteractionResult::Value(()) => {
+                            RemovalStep::SecondConfirmation(RemovalConfirmation {
+                                candidate,
+                                parent,
+                            })
+                        }
+                        InteractionResult::Back => match parent {
+                            RemovalParent::Lookup => RemovalStep::Lookup,
+                            RemovalParent::CandidateSelection { candidates } => {
+                                RemovalStep::CandidateSelection { candidates }
+                            }
+                        },
+                        InteractionResult::Cancel => return Ok(()),
+                    }
+                }
+                RemovalStep::SecondConfirmation(RemovalConfirmation { candidate, parent }) => {
+                    self.show_removal_candidate(&candidate)?;
+                    match self.confirm_removal("Confirm deletion", "Delete")? {
+                        InteractionResult::Value(()) => {
+                            if vault.remove_credential(&candidate.key).is_none() {
+                                return Ok(());
+                            }
+                            Self::persist(path, vault)?;
+                            self.interaction
+                                .message(&format!("Credential entry removed: {}", candidate.key))?;
+                            return Ok(());
+                        }
+                        InteractionResult::Back => {
+                            RemovalStep::FirstConfirmation(RemovalConfirmation {
+                                candidate,
+                                parent,
+                            })
+                        }
+                        InteractionResult::Cancel => return Ok(()),
+                    }
+                }
+            };
         }
-        if !self.confirm_removal("Confirm deletion", "Delete")? {
-            return Ok(());
-        }
-
-        vault.remove_credential(&key);
-        Self::persist(path, vault)
     }
 
-    /// Presents a positive confirmation and returns `false` for the cancellation choice.
+    /// Displays the non-secret context for a pending Credential entry removal.
+    fn show_removal_candidate(&mut self, candidate: &RemovalCandidate) -> Result<(), AppError> {
+        self.interaction
+            .message(&format!("Key: {}\nName: {}", candidate.key, candidate.name))?;
+        Ok(())
+    }
+
+    /// Presents a fuzzy candidate list and returns its navigation result.
+    fn choose_removal_candidate(
+        &mut self,
+        candidates: &[RemovalCandidate],
+    ) -> Result<InteractionResult<usize>, AppError> {
+        let keys: Vec<String> = candidates
+            .iter()
+            .map(|candidate| candidate.key.clone())
+            .collect();
+        self.choose_credential_candidate(&keys)
+    }
+
+    /// Presents a positive confirmation and preserves Back separately from Cancel.
     fn confirm_removal(
         &mut self,
         prompt: &'static str,
         positive_choice: &'static str,
-    ) -> Result<bool, AppError> {
+    ) -> Result<InteractionResult<()>, AppError> {
         let choice = self
             .interaction
             .choose(prompt, &[positive_choice, "Cancel"])?;
         match choice {
-            InteractionResult::Value(0) => Ok(true),
-            InteractionResult::Value(1) | InteractionResult::Back | InteractionResult::Cancel => {
-                Ok(false)
+            InteractionResult::Value(0) => Ok(InteractionResult::Value(())),
+            InteractionResult::Value(1) | InteractionResult::Cancel => {
+                Ok(InteractionResult::Cancel)
             }
+            InteractionResult::Back => Ok(InteractionResult::Back),
             InteractionResult::Value(choice) => Err(AppError::InvalidChoice { prompt, choice }),
         }
     }
 
-    /// Resolves an exact or fuzzy Key, returning `None` when lookup is cancelled.
+    /// Resolves an exact or fuzzy Key, retaining fuzzy candidates for later Back navigation.
     fn resolve_credential<'vault>(
         &mut self,
         vault: &'vault Vault,
-    ) -> Result<Option<&'vault Credential>, AppError> {
+    ) -> Result<Option<CredentialResolution<'vault>>, AppError> {
         loop {
             let query = match self.interaction.input("Key")? {
                 InteractionResult::Value(query) => query,
                 InteractionResult::Back | InteractionResult::Cancel => return Ok(None),
             };
             if let Some(credential) = vault.find_credential(&query) {
-                return Ok(Some(credential));
+                return Ok(Some(CredentialResolution::Exact(credential)));
             }
 
             self.interaction.message("Credential entry not found.")?;
             let suggestions = vault.find_credential_suggestions(&query);
             if !suggestions.is_empty() {
-                let mut options = Self::credential_suggestion_options(&suggestions);
-                options.push("Cancel".to_owned());
-                let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
-                let choice = self
-                    .interaction
-                    .choose("Credential suggestions", &option_references)?;
-                match choice {
-                    InteractionResult::Value(choice) if choice < suggestions.len() => {
-                        return Ok(Some(suggestions[choice]));
-                    }
-                    InteractionResult::Value(choice) if choice == suggestions.len() => {
-                        return Ok(None);
-                    }
-                    InteractionResult::Back | InteractionResult::Cancel => return Ok(None),
+                let options = Self::credential_suggestion_options(&suggestions);
+                match self.choose_credential_candidate(&options)? {
                     InteractionResult::Value(choice) => {
-                        return Err(AppError::InvalidChoice {
-                            prompt: "Credential suggestions",
-                            choice,
-                        });
+                        return Ok(Some(CredentialResolution::Fuzzy {
+                            credential: suggestions[choice],
+                            candidates: suggestions,
+                        }));
                     }
+                    InteractionResult::Back => continue,
+                    InteractionResult::Cancel => return Ok(None),
                 }
             }
 
-            let choice = self
-                .interaction
-                .choose("Credential not found", &["Retry", "Cancel"])?;
+            let choice = loop {
+                let choice = self
+                    .interaction
+                    .choose("Credential not found", &["Retry", "Cancel"])?;
+                match choice {
+                    InteractionResult::Value(0)
+                    | InteractionResult::Value(1)
+                    | InteractionResult::Back
+                    | InteractionResult::Cancel => break choice,
+                    InteractionResult::Value(_) => {
+                        self.interaction
+                            .message("Invalid retry selection. Choose Retry, Back, or Cancel.")?;
+                    }
+                }
+            };
             match choice {
                 InteractionResult::Value(0) => {}
-                InteractionResult::Value(1)
-                | InteractionResult::Back
-                | InteractionResult::Cancel => return Ok(None),
+                InteractionResult::Value(1) | InteractionResult::Cancel => return Ok(None),
+                InteractionResult::Back => continue,
                 InteractionResult::Value(choice) => {
                     return Err(AppError::InvalidChoice {
                         prompt: "Credential not found",
@@ -482,22 +690,166 @@ impl<I: Interaction> App<I> {
         }
     }
 
+    /// Presents fuzzy Key candidates and maps navigation actions to workflow results.
+    fn choose_credential_candidate(
+        &mut self,
+        candidates: &[String],
+    ) -> Result<InteractionResult<usize>, AppError> {
+        loop {
+            let mut options = candidates.to_owned();
+            options.push("Cancel".to_owned());
+            let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
+            let choice = self
+                .interaction
+                .choose("Credential suggestions", &option_references)?;
+            match choice {
+                InteractionResult::Value(choice) if choice < candidates.len() => {
+                    return Ok(InteractionResult::Value(choice));
+                }
+                InteractionResult::Value(choice) if choice == candidates.len() => {
+                    return Ok(InteractionResult::Cancel);
+                }
+                InteractionResult::Back => return Ok(InteractionResult::Back),
+                InteractionResult::Cancel => return Ok(InteractionResult::Cancel),
+                InteractionResult::Value(_) => {
+                    self.interaction.message(
+                        "Invalid Credential suggestion selection. Choose a suggestion, Back, or Cancel.",
+                    )?;
+                }
+            }
+        }
+    }
+
     /// Collects one Credential using a manual or Generated value and persists it after duplicate handling.
     fn add_credential(&mut self, path: &Path, vault: &mut Vault) -> Result<(), AppError> {
-        let use_generated_value = match self
-            .interaction
-            .choose("Value type", &["Manual Value", "Generated value"])?
-        {
-            InteractionResult::Value(0) => false,
-            InteractionResult::Value(1) => true,
-            InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
-            InteractionResult::Value(choice) => {
-                return Err(AppError::InvalidChoice {
-                    prompt: "Value type",
-                    choice,
-                });
+        let mut draft = CredentialDraft::default();
+
+        loop {
+            let use_generated_value = match self
+                .interaction
+                .choose("Value type", &["Manual Value", "Generated value"])?
+            {
+                InteractionResult::Value(0) => false,
+                InteractionResult::Value(1) => true,
+                InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
+                InteractionResult::Value(choice) => {
+                    return Err(AppError::InvalidChoice {
+                        prompt: "Value type",
+                        choice,
+                    });
+                }
+            };
+
+            if use_generated_value {
+                return self.add_generated_credential(path, vault);
             }
-        };
+
+            match self.add_manual_credential(path, vault, &mut draft)? {
+                ManualDraftOutcome::BackToValueType => {}
+                ManualDraftOutcome::Completed => return Ok(()),
+            }
+        }
+    }
+
+    /// Collects, reviews, and conditionally saves one manual Credential Draft.
+    fn add_manual_credential(
+        &mut self,
+        path: &Path,
+        vault: &mut Vault,
+        draft: &mut CredentialDraft,
+    ) -> Result<ManualDraftOutcome, AppError> {
+        let mut step = ManualDraftStep::Key;
+
+        loop {
+            match step {
+                ManualDraftStep::Key => {
+                    match self.interaction.input_with_default("Key", &draft.key)? {
+                        InteractionResult::Value(key) => {
+                            draft.key = key;
+                            step = ManualDraftStep::Name;
+                        }
+                        InteractionResult::Back => {
+                            return Ok(ManualDraftOutcome::BackToValueType);
+                        }
+                        InteractionResult::Cancel => {
+                            return Ok(ManualDraftOutcome::Completed);
+                        }
+                    }
+                }
+                ManualDraftStep::Name => {
+                    match self.interaction.input_with_default("Name", &draft.name)? {
+                        InteractionResult::Value(name) => {
+                            draft.name = name;
+                            step = ManualDraftStep::Value;
+                        }
+                        InteractionResult::Back => step = ManualDraftStep::Key,
+                        InteractionResult::Cancel => {
+                            return Ok(ManualDraftOutcome::Completed);
+                        }
+                    }
+                }
+                ManualDraftStep::Value => match self
+                    .interaction
+                    .password_with_default("Value", &draft.value)?
+                {
+                    InteractionResult::Value(value) => {
+                        draft.value = value;
+                        step = ManualDraftStep::Review;
+                    }
+                    InteractionResult::Back => step = ManualDraftStep::Name,
+                    InteractionResult::Cancel => {
+                        return Ok(ManualDraftOutcome::Completed);
+                    }
+                },
+                ManualDraftStep::Review => {
+                    self.interaction.message(&format!(
+                        "Key: {}\nName: {}\nValue: [REDACTED]",
+                        draft.key, draft.name
+                    ))?;
+                    let choice = self
+                        .interaction
+                        .choose("Review", &["Save", "Back", "Cancel"])?;
+                    match choice {
+                        InteractionResult::Value(0) => {
+                            let credential = Credential::new(
+                                draft.key.clone(),
+                                draft.name.clone(),
+                                draft.value.clone(),
+                            );
+                            match self.save_credential(path, vault, credential, "Back")? {
+                                CredentialSaveOutcome::Saved => {
+                                    self.interaction.message("Credential entry saved.")?;
+                                    return Ok(ManualDraftOutcome::Completed);
+                                }
+                                CredentialSaveOutcome::Back => {
+                                    step = ManualDraftStep::Review;
+                                    continue;
+                                }
+                                CredentialSaveOutcome::Cancelled => {
+                                    return Ok(ManualDraftOutcome::Completed);
+                                }
+                            }
+                        }
+                        InteractionResult::Value(1) | InteractionResult::Back => {
+                            step = ManualDraftStep::Value;
+                        }
+                        InteractionResult::Value(2) | InteractionResult::Cancel => {
+                            return Ok(ManualDraftOutcome::Completed);
+                        }
+                        InteractionResult::Value(choice) => {
+                            return Err(AppError::InvalidChoice {
+                                prompt: "Review",
+                                choice,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collects one Generated-value Credential and persists it after duplicate handling.
+    fn add_generated_credential(&mut self, path: &Path, vault: &mut Vault) -> Result<(), AppError> {
         let key = match self.interaction.input("Key")? {
             InteractionResult::Value(key) => key,
             InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
@@ -506,30 +858,39 @@ impl<I: Interaction> App<I> {
             InteractionResult::Value(name) => name,
             InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
         };
-        let value = if use_generated_value {
-            match self.generated_value()? {
-                Some(value) => value,
-                None => return Ok(()),
-            }
-        } else {
-            match self.interaction.password("Value")? {
-                InteractionResult::Value(value) => value,
-                InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
-            }
+        let value = match self.generated_value()? {
+            Some(value) => value,
+            None => return Ok(()),
         };
         let credential = Credential::new(key, name, value);
 
+        match self.save_credential(path, vault, credential, "Cancel")? {
+            CredentialSaveOutcome::Saved
+            | CredentialSaveOutcome::Back
+            | CredentialSaveOutcome::Cancelled => Ok(()),
+        }
+    }
+
+    /// Resolves a duplicate Key and persists `credential` only after an explicit save decision.
+    fn save_credential(
+        &mut self,
+        path: &Path,
+        vault: &mut Vault,
+        credential: Credential,
+        duplicate_return_label: &'static str,
+    ) -> Result<CredentialSaveOutcome, AppError> {
         if vault.find_credential(credential.key()).is_some() {
             self.interaction
                 .message("A Credential entry with that Key already exists.")?;
             let choice = self
                 .interaction
-                .choose("Duplicate Key", &["Overwrite", "Cancel"])?;
+                .choose("Duplicate Key", &["Overwrite", duplicate_return_label])?;
             match choice {
                 InteractionResult::Value(0) => {}
-                InteractionResult::Value(1)
-                | InteractionResult::Back
-                | InteractionResult::Cancel => return Ok(()),
+                InteractionResult::Value(1) | InteractionResult::Back => {
+                    return Ok(CredentialSaveOutcome::Back);
+                }
+                InteractionResult::Cancel => return Ok(CredentialSaveOutcome::Cancelled),
                 InteractionResult::Value(choice) => {
                     return Err(AppError::InvalidChoice {
                         prompt: "Duplicate Key",
@@ -540,7 +901,8 @@ impl<I: Interaction> App<I> {
         }
 
         vault.upsert_credential(credential);
-        Self::persist(path, vault)
+        Self::persist(path, vault)?;
+        Ok(CredentialSaveOutcome::Saved)
     }
 
     /// Collects Generated value options and lets the user review each generated value.
@@ -635,79 +997,44 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Reads a Key query and routes exact, fuzzy, and missing results to their child pages.
-    fn get_key_lookup(&mut self, vault: &Vault) -> Result<(), AppError> {
-        let query = match self.interaction.input("Key")? {
-            InteractionResult::Value(query) => query,
-            InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
+    /// Looks up and displays one Credential through the reversible Get page hierarchy.
+    fn get_credential(&mut self, vault: &Vault) -> Result<(), AppError> {
+        let Some(resolution) = self.resolve_credential(vault)? else {
+            return Ok(());
         };
-
-        if let Some(credential) = vault.find_credential(&query) {
-            return self.get_detail_page(vault, credential, GetDetailParent::KeyLookup);
-        }
-
-        self.interaction.message("Credential entry not found.")?;
-        let suggestions = vault.find_credential_suggestions(&query);
-        if suggestions.is_empty() {
-            self.get_retry_page(vault)
-        } else {
-            self.get_suggestions_page(vault, query, suggestions)
-        }
+        let (credential, parent) = match resolution {
+            CredentialResolution::Exact(credential) => (credential, GetDetailParent::KeyLookup),
+            CredentialResolution::Fuzzy {
+                credential,
+                candidates,
+            } => (credential, GetDetailParent::Suggestions(candidates)),
+        };
+        self.get_detail_page(vault, credential, parent)
     }
 
-    /// Presents fuzzy Key suggestions and returns Back to the preceding Key lookup page.
-    fn get_suggestions_page(
+    /// Presents retained fuzzy Keys and routes Back to a fresh Key lookup.
+    fn get_suggestions_page<'vault>(
         &mut self,
-        vault: &Vault,
-        query: String,
-        suggestions: Vec<&Credential>,
+        vault: &'vault Vault,
+        suggestions: Vec<&'vault Credential>,
     ) -> Result<(), AppError> {
-        let mut options = Self::credential_suggestion_options(&suggestions);
-        options.push("Cancel".to_owned());
-        let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
-        let choice = self
-            .interaction
-            .choose("Credential suggestions", &option_references)?;
-        match choice {
-            InteractionResult::Value(choice) if choice < suggestions.len() => self.get_detail_page(
-                vault,
-                suggestions[choice],
-                GetDetailParent::Suggestions(query),
-            ),
-            InteractionResult::Value(choice) if choice == suggestions.len() => Ok(()),
-            InteractionResult::Back => self.get_key_lookup(vault),
+        let options = Self::credential_suggestion_options(&suggestions);
+        match self.choose_credential_candidate(&options)? {
+            InteractionResult::Value(choice) => {
+                let credential = suggestions[choice];
+                self.get_detail_page(vault, credential, GetDetailParent::Suggestions(suggestions))
+            }
+            InteractionResult::Back => self.get_credential(vault),
             InteractionResult::Cancel => Ok(()),
-            InteractionResult::Value(_) => {
-                self.interaction.message(
-                    "Invalid Credential suggestion selection. Choose a suggestion, Back, or Cancel.",
-                )?;
-                self.get_suggestions_page(vault, query, suggestions)
-            }
-        }
-    }
-
-    /// Presents retry feedback for a missing Key and returns Back to Key lookup.
-    fn get_retry_page(&mut self, vault: &Vault) -> Result<(), AppError> {
-        let choice = self
-            .interaction
-            .choose("Credential not found", &["Retry", "Cancel"])?;
-        match choice {
-            InteractionResult::Value(0) | InteractionResult::Back => self.get_key_lookup(vault),
-            InteractionResult::Value(1) | InteractionResult::Cancel => Ok(()),
-            InteractionResult::Value(_) => {
-                self.interaction
-                    .message("Invalid retry selection. Choose Retry, Back, or Cancel.")?;
-                self.get_retry_page(vault)
-            }
         }
     }
 
     /// Displays a Credential and routes Continue or Cancel to Vault Home, or Back to its parent.
-    fn get_detail_page(
+    fn get_detail_page<'vault>(
         &mut self,
-        vault: &Vault,
-        credential: &Credential,
-        parent: GetDetailParent,
+        vault: &'vault Vault,
+        credential: &'vault Credential,
+        parent: GetDetailParent<'vault>,
     ) -> Result<(), AppError> {
         let navigation = self.interaction.display(
             "Credential entry",
@@ -722,10 +1049,9 @@ impl<I: Interaction> App<I> {
         match navigation {
             InteractionResult::Value(()) | InteractionResult::Cancel => Ok(()),
             InteractionResult::Back => match parent {
-                GetDetailParent::KeyLookup => self.get_key_lookup(vault),
-                GetDetailParent::Suggestions(query) => {
-                    let suggestions = vault.find_credential_suggestions(&query);
-                    self.get_suggestions_page(vault, query, suggestions)
+                GetDetailParent::KeyLookup => self.get_credential(vault),
+                GetDetailParent::Suggestions(suggestions) => {
+                    self.get_suggestions_page(vault, suggestions)
                 }
             },
         }

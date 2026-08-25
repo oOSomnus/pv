@@ -197,7 +197,12 @@ impl TuiInteraction {
         let mut value = String::new();
         loop {
             let displayed = if hidden {
-                "•".repeat(value.chars().count())
+                let character_count = if value.is_empty() {
+                    default.map_or(0, |default| default.chars().count())
+                } else {
+                    value.chars().count()
+                };
+                "•".repeat(character_count)
             } else if value.is_empty() {
                 default
                     .map(|default| format!("[{default}]"))
@@ -352,6 +357,15 @@ impl Interaction for TuiInteraction {
     /// Reads a hidden password as an ordinary value, Back, or Cancel.
     fn password(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError> {
         self.read_text(prompt, None, true)
+    }
+
+    /// Reads a hidden value while allowing Enter to retain an existing draft Value.
+    fn password_with_default(
+        &mut self,
+        prompt: &str,
+        default: &str,
+    ) -> Result<InteractionResult<String>, InteractionError> {
+        self.read_text(prompt, Some(default), true)
     }
 
     /// Reads visible text as an ordinary value, Back, or Cancel.
