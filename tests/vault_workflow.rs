@@ -7,21 +7,31 @@ use pv::{
 };
 use tempfile::tempdir;
 
+/// Test-only representation of an envelope with an unsupported version.
 #[derive(Encode)]
 struct UnsupportedEnvelope {
+    /// The intentionally unsupported format version.
     version: u8,
+    /// A placeholder salt for the malformed fixture.
     salt: [u8; 16],
+    /// A placeholder nonce for the malformed fixture.
     nonce: [u8; 12],
+    /// Placeholder ciphertext that is never decrypted.
     cipher_text: Vec<u8>,
 }
 
+/// Scripted interaction adapter used to drive workflow tests deterministically.
 struct ScriptedInteraction {
+    /// Passwords returned in prompt order.
     passwords: VecDeque<String>,
+    /// Menu selections returned in prompt order.
     choices: VecDeque<usize>,
+    /// Messages emitted by the workflow.
     messages: Rc<RefCell<Vec<String>>>,
 }
 
 impl ScriptedInteraction {
+    /// Creates an adapter with a scripted sequence of password responses.
     fn with_passwords(passwords: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             passwords: passwords.into_iter().map(Into::into).collect(),
@@ -30,35 +40,41 @@ impl ScriptedInteraction {
         }
     }
 
+    /// Adds a scripted sequence of menu selections to this adapter.
     fn with_choices(mut self, choices: impl IntoIterator<Item = usize>) -> Self {
         self.choices = choices.into_iter().collect();
         self
     }
 
+    /// Returns a shared view of the messages emitted by the adapter.
     fn message_log(&self) -> Rc<RefCell<Vec<String>>> {
         Rc::clone(&self.messages)
     }
 }
 
 impl Interaction for ScriptedInteraction {
+    /// Returns the next scripted password response.
     fn password(&mut self, _prompt: &str) -> Result<String, InteractionError> {
         self.passwords
             .pop_front()
             .ok_or_else(|| InteractionError::new("no scripted password available"))
     }
 
+    /// Returns the next scripted menu selection.
     fn choose(&mut self, _prompt: &str, _options: &[&str]) -> Result<usize, InteractionError> {
         self.choices
             .pop_front()
             .ok_or_else(|| InteractionError::new("no scripted choice available"))
     }
 
+    /// Records a workflow message for later assertions.
     fn message(&mut self, message: &str) -> Result<(), InteractionError> {
         self.messages.borrow_mut().push(message.to_owned());
         Ok(())
     }
 }
 
+/// Verifies that initialization persists an encrypted Vault at a custom path.
 #[test]
 fn init_persists_an_encrypted_empty_vault_at_a_custom_path() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -79,6 +95,7 @@ fn init_persists_an_encrypted_empty_vault_at_a_custom_path() {
     assert!(Vault::unlock(&bytes, "wrong password").is_err());
 }
 
+/// Verifies that one App instance can initialize and reopen an empty Vault.
 #[test]
 fn init_then_open_completes_the_empty_vault_lifecycle() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -99,6 +116,7 @@ fn init_then_open_completes_the_empty_vault_lifecycle() {
     );
 }
 
+/// Verifies that each Vault save uses a fresh encryption nonce.
 #[test]
 fn saving_an_unmodified_vault_uses_a_fresh_nonce() {
     let vault = Vault::new("nonce password").expect("vault should be generated");
@@ -110,6 +128,7 @@ fn saving_an_unmodified_vault_uses_a_fresh_nonce() {
     assert!(Vault::unlock(&second_save, "nonce password").is_ok());
 }
 
+/// Verifies that mismatched initialization passwords do not create a file.
 #[test]
 fn init_rejects_mismatched_master_password_without_creating_a_file() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -127,6 +146,7 @@ fn init_rejects_mismatched_master_password_without_creating_a_file() {
     assert!(!path.exists());
 }
 
+/// Verifies that initialization refuses to overwrite an existing file.
 #[test]
 fn init_refuses_to_overwrite_an_existing_vault() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -146,6 +166,7 @@ fn init_refuses_to_overwrite_an_existing_vault() {
     );
 }
 
+/// Verifies that initialization retries an empty Master password.
 #[test]
 fn init_reprompts_when_a_master_password_is_empty() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -165,6 +186,7 @@ fn init_reprompts_when_a_master_password_is_empty() {
     assert!(path.exists());
 }
 
+/// Verifies that opening an empty Vault enters a menu and exits without mutation.
 #[test]
 fn open_unlocks_a_vault_and_exits_the_empty_vault_menu_without_mutation() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -186,6 +208,7 @@ fn open_unlocks_a_vault_and_exits_the_empty_vault_menu_without_mutation() {
     );
 }
 
+/// Verifies that an incorrect password is reported and can be retried.
 #[test]
 fn open_reports_an_incorrect_password_and_allows_a_retry() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -216,6 +239,7 @@ fn open_reports_an_incorrect_password_and_allows_a_retry() {
     );
 }
 
+/// Verifies that a user can cancel after an incorrect password without mutation.
 #[test]
 fn open_can_cancel_after_an_incorrect_password_without_mutating_the_vault() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -245,6 +269,7 @@ fn open_can_cancel_after_an_incorrect_password_without_mutating_the_vault() {
     );
 }
 
+/// Verifies that a missing Vault file produces a user-facing error.
 #[test]
 fn open_reports_a_missing_vault_file_as_a_user_facing_error() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -258,6 +283,7 @@ fn open_reports_a_missing_vault_file_as_a_user_facing_error() {
     assert!(error.to_string().contains("could not read vault"));
 }
 
+/// Verifies that malformed Vault bytes are reported without replacement.
 #[test]
 fn open_reports_malformed_vault_bytes_without_replacing_the_file() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -277,6 +303,7 @@ fn open_reports_malformed_vault_bytes_without_replacing_the_file() {
     );
 }
 
+/// Verifies that unsupported Vault versions are reported without replacement.
 #[test]
 fn open_reports_an_unsupported_vault_version_without_replacing_the_file() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -305,6 +332,7 @@ fn open_reports_an_unsupported_vault_version_without_replacing_the_file() {
     );
 }
 
+/// Verifies that an unreadable Vault path produces a user-facing error.
 #[test]
 fn open_reports_an_unreadable_vault_path_without_replacing_it() {
     let directory = tempdir().expect("temporary directory should be created");
