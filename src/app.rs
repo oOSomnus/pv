@@ -274,6 +274,31 @@ struct CredentialDraft {
     name: String,
     /// The opaque secret entered for the pending Credential.
     value: String,
+    /// The source selected for the pending Value, shown on Review.
+    value_source: Option<CredentialValueSource>,
+    /// The Random settings retained while the Draft is navigated.
+    generated_settings: GeneratedValueSettings,
+    /// The current unsaved Random candidate, when one has been generated.
+    generated_candidate: Option<String>,
+}
+
+/// Identifies how the pending Credential Value was collected.
+#[derive(Clone, Copy)]
+enum CredentialValueSource {
+    /// The user entered the Value manually.
+    Manual,
+    /// The application generated the Value from Random settings.
+    Random,
+}
+
+impl CredentialValueSource {
+    /// Returns the user-visible source label shown on Review.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::Random => "Random",
+        }
+    }
 }
 
 /// Identifies the current step in the Credential Draft workflow.
@@ -819,7 +844,7 @@ impl<I: Interaction> App<I> {
                         InteractionResult::Cancel => return Ok(()),
                     }
                 }
-                CredentialDraftStep::Value => match self.collect_value(&draft.value)? {
+                CredentialDraftStep::Value => match self.collect_value(&mut draft)? {
                     ValueCollectionOutcome::Value(value) => {
                         draft.value = value;
                         step = CredentialDraftStep::Review;
@@ -828,9 +853,13 @@ impl<I: Interaction> App<I> {
                     ValueCollectionOutcome::Cancel => return Ok(()),
                 },
                 CredentialDraftStep::Review => {
+                    let value_source = draft
+                        .value_source
+                        .map(CredentialValueSource::label)
+                        .unwrap_or("Unknown");
                     self.interaction.message(&format!(
-                        "Key: {}\nName: {}\nValue: [REDACTED]",
-                        draft.key, draft.name
+                        "Key: {}\nName: {}\nValue source: {value_source}\nValue: [REDACTED]",
+                        draft.key, draft.name,
                     ))?;
                     let choice = self
                         .interaction
@@ -867,25 +896,33 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Collects a manual or Generated value directly from the Value step.
-    fn collect_value(&mut self, current_value: &str) -> Result<ValueCollectionOutcome, AppError> {
+    /// Collects a manual or Generated value while retaining the Draft state.
+    fn collect_value(
+        &mut self,
+        draft: &mut CredentialDraft,
+    ) -> Result<ValueCollectionOutcome, AppError> {
         loop {
             let choice = self.interaction.choose("Value", &["Manual", "Random"])?;
             match choice {
                 InteractionResult::Value(0) => {
                     match self
                         .interaction
-                        .password_with_default("Value", current_value)?
+                        .password_with_default("Value", &draft.value)?
                     {
                         InteractionResult::Value(value) => {
+                            draft.value = value.clone();
+                            draft.value_source = Some(CredentialValueSource::Manual);
+                            draft.generated_candidate = None;
                             return Ok(ValueCollectionOutcome::Value(value));
                         }
                         InteractionResult::Back => continue,
                         InteractionResult::Cancel => return Ok(ValueCollectionOutcome::Cancel),
                     }
                 }
-                InteractionResult::Value(1) => match self.collect_generated_value()? {
+                InteractionResult::Value(1) => match self.collect_generated_value(draft)? {
                     ValueCollectionOutcome::Value(value) => {
+                        draft.value = value.clone();
+                        draft.value_source = Some(CredentialValueSource::Random);
                         return Ok(ValueCollectionOutcome::Value(value));
                     }
                     ValueCollectionOutcome::Back => continue,
@@ -903,15 +940,17 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Collects Generated value settings and keeps the candidate in memory until confirmation.
-    fn collect_generated_value(&mut self) -> Result<ValueCollectionOutcome, AppError> {
-        let mut settings = GeneratedValueSettings::default();
+    /// Collects and retains Random settings until the Draft is saved or abandoned.
+    fn collect_generated_value(
+        &mut self,
+        draft: &mut CredentialDraft,
+    ) -> Result<ValueCollectionOutcome, AppError> {
         let mut step = GeneratedValueSettingsStep::Length;
 
         loop {
             match step {
                 GeneratedValueSettingsStep::Length => {
-                    let default_length = settings.length.to_string();
+                    let default_length = draft.generated_settings.length.to_string();
                     let entered = match self
                         .interaction
                         .input_with_default("Generated value length (8-100)", &default_length)?
@@ -922,7 +961,7 @@ impl<I: Interaction> App<I> {
                     };
                     let trimmed = entered.trim();
                     let length = if trimmed.is_empty() {
-                        settings.length
+                        draft.generated_settings.length
                     } else {
                         match trimmed.parse::<usize>() {
                             Ok(length) => length,
@@ -934,17 +973,26 @@ impl<I: Interaction> App<I> {
                             }
                         }
                     };
-                    if let Err(error) = settings.with_length(length) {
+                    if let Err(error) = draft.generated_settings.with_length(length) {
                         self.interaction.message(&error.to_string())?;
                         continue;
                     }
-                    settings.length = length;
+                    if draft.generated_settings.length != length {
+                        draft.generated_candidate = None;
+                    }
+                    draft.generated_settings.length = length;
                     step = GeneratedValueSettingsStep::Numbers;
                 }
                 GeneratedValueSettingsStep::Numbers => {
-                    match self.choose_generated_toggle("Numbers", settings.include_numbers)? {
+                    match self.choose_generated_toggle(
+                        "Numbers",
+                        draft.generated_settings.include_numbers,
+                    )? {
                         InteractionResult::Value(include_numbers) => {
-                            settings.include_numbers = include_numbers;
+                            if draft.generated_settings.include_numbers != include_numbers {
+                                draft.generated_candidate = None;
+                            }
+                            draft.generated_settings.include_numbers = include_numbers;
                             step = GeneratedValueSettingsStep::Symbols;
                         }
                         InteractionResult::Back => step = GeneratedValueSettingsStep::Length,
@@ -952,10 +1000,17 @@ impl<I: Interaction> App<I> {
                     }
                 }
                 GeneratedValueSettingsStep::Symbols => {
-                    match self.choose_generated_toggle("Symbols", settings.include_symbols)? {
+                    match self.choose_generated_toggle(
+                        "Symbols",
+                        draft.generated_settings.include_symbols,
+                    )? {
                         InteractionResult::Value(include_symbols) => {
-                            settings.include_symbols = include_symbols;
-                            match self.generated_value_candidate(settings.options()?)? {
+                            if draft.generated_settings.include_symbols != include_symbols {
+                                draft.generated_candidate = None;
+                            }
+                            draft.generated_settings.include_symbols = include_symbols;
+                            let options = draft.generated_settings.options()?;
+                            match self.generated_value_candidate(draft, options)? {
                                 ValueCollectionOutcome::Value(value) => {
                                     return Ok(ValueCollectionOutcome::Value(value));
                                 }
@@ -998,15 +1053,16 @@ impl<I: Interaction> App<I> {
     /// Presents a masked Generated value candidate and returns only an explicitly confirmed Value.
     fn generated_value_candidate(
         &mut self,
+        draft: &mut CredentialDraft,
         options: GeneratedValueOptions,
     ) -> Result<ValueCollectionOutcome, AppError> {
-        let mut previous = None;
+        let mut candidate = match draft.generated_candidate.take() {
+            Some(candidate) => candidate,
+            None => generator::generate(options)?,
+        };
 
         loop {
-            let candidate = generator::generate(options)?;
-            if previous.as_deref() == Some(candidate.as_str()) {
-                continue;
-            }
+            draft.generated_candidate = Some(candidate.clone());
             let message = format!("Generated value candidate: {}", mask_value(&candidate));
             let choice = self.interaction.choose_page(
                 "Generated value",
@@ -1017,7 +1073,15 @@ impl<I: Interaction> App<I> {
                 InteractionResult::Value(0) => {
                     return Ok(ValueCollectionOutcome::Value(candidate));
                 }
-                InteractionResult::Value(1) => previous = Some(candidate),
+                InteractionResult::Value(1) => {
+                    let previous = candidate;
+                    loop {
+                        candidate = generator::generate(options)?;
+                        if candidate != previous {
+                            break;
+                        }
+                    }
+                }
                 InteractionResult::Value(2) | InteractionResult::Back => {
                     return Ok(ValueCollectionOutcome::Back);
                 }

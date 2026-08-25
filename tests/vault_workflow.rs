@@ -587,7 +587,7 @@ fn manual_add_backtracks_through_fields_and_preserves_the_draft() {
     assert_eq!(
         messages.borrow().as_slice(),
         [
-            "Key: youtube\nName: alice\nValue: [REDACTED]",
+            "Key: youtube\nName: alice\nValue source: Manual\nValue: [REDACTED]",
             "Credential entry saved."
         ]
     );
@@ -644,7 +644,7 @@ fn manual_add_can_be_cancelled_without_mutating_the_vault() {
     assert_eq!(
         messages.borrow().as_slice(),
         [
-            "Key: youtube\nName: alice\nValue: [REDACTED]",
+            "Key: youtube\nName: alice\nValue source: Manual\nValue: [REDACTED]",
             "Credential entry not found."
         ]
     );
@@ -690,7 +690,7 @@ fn generated_value_path_uses_defaults_masks_candidate_and_saves_through_review()
         messages.borrow().as_slice(),
         [
             "Generated value candidate: ••••••••••••••••••••",
-            "Key: youtube\nName: alice\nValue: [REDACTED]",
+            "Key: youtube\nName: alice\nValue source: Random\nValue: [REDACTED]",
             "Credential entry saved."
         ]
     );
@@ -761,6 +761,90 @@ fn generated_value_path_uses_defaults_masks_candidate_and_saves_through_review()
             .borrow()
             .iter()
             .any(|message| message.contains(&saved_value))
+    );
+}
+
+/// Verifies that Review identifies a Generated value without exposing its secret.
+#[test]
+fn generated_value_review_shows_the_value_source() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("random-review-source.vault");
+    let master_password = "random review source password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube", "alice", ""])
+        .with_choices([0, 1, 0, 0, 0, 0, 3]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("the Generated value should reach Review");
+
+    assert!(messages.borrow().iter().any(|message| {
+        message.contains("Value source: Random") && message.contains("Value: [REDACTED]")
+    }));
+}
+
+/// Verifies that Random settings remain part of the Draft after Back leaves the generator.
+#[test]
+fn generated_value_back_preserves_settings_when_reentering_random() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("random-settings-draft.vault");
+    let master_password = "random settings draft password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([
+            InteractionResult::Value("youtube".to_owned()),
+            InteractionResult::Value("alice".to_owned()),
+            InteractionResult::Value("10".to_owned()),
+            InteractionResult::Back,
+            InteractionResult::Value(String::new()),
+        ])
+        .with_choice_results([
+            InteractionResult::Value(0),
+            InteractionResult::Value(1),
+            InteractionResult::Value(0),
+            InteractionResult::Value(0),
+            InteractionResult::Value(2),
+            InteractionResult::Back,
+            InteractionResult::Back,
+            InteractionResult::Value(1),
+            InteractionResult::Value(0),
+            InteractionResult::Value(0),
+            InteractionResult::Value(0),
+            InteractionResult::Value(0),
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("the preserved Random Draft should be saveable");
+
+    let candidates: Vec<String> = messages
+        .borrow()
+        .iter()
+        .filter(|message| message.starts_with("Generated value candidate: "))
+        .cloned()
+        .collect();
+    assert_eq!(
+        candidates,
+        [
+            "Generated value candidate: ••••••••••",
+            "Generated value candidate: ••••••••••",
+        ]
     );
 }
 
@@ -923,7 +1007,7 @@ fn generated_value_back_returns_to_the_value_step_and_preserves_the_draft() {
         [
             "Generated value candidate: ••••••••",
             "Generated value candidate: ••••••••",
-            "Key: youtube\nName: alice\nValue: [REDACTED]",
+            "Key: youtube\nName: alice\nValue source: Manual\nValue: [REDACTED]",
             "Credential entry saved."
         ]
     );
@@ -1114,9 +1198,9 @@ fn duplicate_normalized_key_overwrites_name_and_value() {
     assert_eq!(
         duplicate_messages.borrow().as_slice(),
         [
-            "Key:   YouTube  \nName: first name\nValue: [REDACTED]",
+            "Key:   YouTube  \nName: first name\nValue source: Manual\nValue: [REDACTED]",
             "Credential entry saved.",
-            "Key: youtube\nName: second name\nValue: [REDACTED]",
+            "Key: youtube\nName: second name\nValue source: Manual\nValue: [REDACTED]",
             "A Credential entry with that Key already exists.",
             "Credential entry saved."
         ]
