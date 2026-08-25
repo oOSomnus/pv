@@ -26,4 +26,22 @@ The password that unlocks a vault; it is separate from every credential value st
 A record identified by a key and containing the associated name and value.
 
 **Generated value**:
-A randomly generated credential value produced from a user-selected length and character set before it is confirmed for storage.
+A randomly generated credential value produced from user-selected generation settings before it is confirmed for storage.
+
+**Symbol set**:
+The compatibility characters `!@.-_*` available to a Generated value when symbol generation is enabled. Enabling the Symbol set requires at least one of these characters in the Generated value; it does not validate or restrict a manually entered Value.
+
+## Workflow
+
+**Draft**:
+A credential entry being assembled but not yet stored in a Vault. A draft can be revised or abandoned without changing the Vault.
+
+**Back**:
+The action that moves from the current workflow step to its immediate parent while retaining the current Draft.
+
+_Avoid_: Cancel
+
+**Cancel**:
+The action that abandons the current operation and Draft without persisting changes, returning to Vault navigation.
+
+_Avoid_: Back
