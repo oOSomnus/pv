@@ -2,11 +2,11 @@ use rand::{TryRng, rngs::SysRng};
 use thiserror::Error;
 
 /// The shortest supported Generated value length.
-pub const MIN_LENGTH: usize = 10;
+pub const MIN_LENGTH: usize = 8;
 /// The longest supported Generated value length.
 pub const MAX_LENGTH: usize = 100;
 /// The default Generated value length used when no length is entered.
-pub const DEFAULT_LENGTH: usize = 16;
+pub const DEFAULT_LENGTH: usize = 20;
 
 /// Errors returned while validating or generating a Generated value.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -28,19 +28,19 @@ pub enum GeneratorError {
 pub struct GeneratedValueOptions {
     /// The number of characters in the generated Value.
     length: usize,
-    /// Whether decimal digits are included and guaranteed to appear.
-    include_digits: bool,
-    /// Whether ASCII punctuation is included and guaranteed to appear.
-    include_punctuation: bool,
+    /// Whether decimal Numbers are included and guaranteed to appear.
+    include_numbers: bool,
+    /// Whether the supported Symbols are included and guaranteed to appear.
+    include_symbols: bool,
 }
 
 impl Default for GeneratedValueOptions {
-    /// Returns the default length with digits and punctuation enabled.
+    /// Returns the default length with Numbers enabled and Symbols disabled.
     fn default() -> Self {
         Self {
             length: DEFAULT_LENGTH,
-            include_digits: true,
-            include_punctuation: true,
+            include_numbers: true,
+            include_symbols: false,
         }
     }
 }
@@ -49,8 +49,8 @@ impl GeneratedValueOptions {
     /// Creates options after validating the inclusive supported length range.
     pub fn new(
         length: usize,
-        include_digits: bool,
-        include_punctuation: bool,
+        include_numbers: bool,
+        include_symbols: bool,
     ) -> Result<Self, GeneratorError> {
         if !(MIN_LENGTH..=MAX_LENGTH).contains(&length) {
             return Err(GeneratorError::InvalidLength { length });
@@ -58,8 +58,8 @@ impl GeneratedValueOptions {
 
         Ok(Self {
             length,
-            include_digits,
-            include_punctuation,
+            include_numbers,
+            include_symbols,
         })
     }
 
@@ -68,14 +68,24 @@ impl GeneratedValueOptions {
         self.length
     }
 
-    /// Returns whether decimal digits are enabled.
-    pub const fn includes_digits(self) -> bool {
-        self.include_digits
+    /// Returns whether decimal Numbers are enabled.
+    pub const fn includes_numbers(self) -> bool {
+        self.include_numbers
     }
 
-    /// Returns whether punctuation is enabled.
+    /// Returns whether decimal Numbers are enabled.
+    pub const fn includes_digits(self) -> bool {
+        self.includes_numbers()
+    }
+
+    /// Returns whether the supported Symbols are enabled.
+    pub const fn includes_symbols(self) -> bool {
+        self.include_symbols
+    }
+
+    /// Returns whether the supported Symbols are enabled through the legacy punctuation name.
     pub const fn includes_punctuation(self) -> bool {
-        self.include_punctuation
+        self.includes_symbols()
     }
 }
 
@@ -88,18 +98,18 @@ impl GeneratedValueOptions {
 pub fn generate(options: GeneratedValueOptions) -> Result<String, GeneratorError> {
     /// The ASCII letters available in every Generated value.
     const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    /// The decimal digits available when digit generation is enabled.
-    const DIGITS: &[u8] = b"0123456789";
-    /// The non-whitespace ASCII punctuation available when punctuation is enabled.
-    const PUNCTUATION: &[u8] = b"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+    /// The decimal Numbers available when Number generation is enabled.
+    const NUMBERS: &[u8] = b"0123456789";
+    /// The exact Symbols available when Symbol generation is enabled.
+    const SYMBOLS: &[u8] = b"!@.-_*";
 
     let mut rng = SysRng;
     let mut character_sets = vec![LETTERS];
-    if options.include_digits {
-        character_sets.push(DIGITS);
+    if options.include_numbers {
+        character_sets.push(NUMBERS);
     }
-    if options.include_punctuation {
-        character_sets.push(PUNCTUATION);
+    if options.include_symbols {
+        character_sets.push(SYMBOLS);
     }
 
     let all_characters: Vec<u8> = character_sets
