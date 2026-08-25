@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{cell::RefCell, collections::VecDeque, path::Path, rc::Rc};
 
 use bincode::{Encode, config, encode_to_vec};
 use pv::{
@@ -34,6 +34,8 @@ struct ScriptedInteraction {
     password_prompts: Rc<RefCell<Vec<String>>>,
     /// Prompts that requested visible text input.
     input_prompts: Rc<RefCell<Vec<String>>>,
+    /// Prompts and options presented by menu selections.
+    choice_options: Rc<RefCell<Vec<Vec<String>>>>,
 }
 
 impl ScriptedInteraction {
@@ -46,6 +48,7 @@ impl ScriptedInteraction {
             messages: Rc::new(RefCell::new(Vec::new())),
             password_prompts: Rc::new(RefCell::new(Vec::new())),
             input_prompts: Rc::new(RefCell::new(Vec::new())),
+            choice_options: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -75,6 +78,11 @@ impl ScriptedInteraction {
     fn input_prompt_log(&self) -> Rc<RefCell<Vec<String>>> {
         Rc::clone(&self.input_prompts)
     }
+
+    /// Returns a shared view of every menu's displayed options.
+    fn choice_options_log(&self) -> Rc<RefCell<Vec<Vec<String>>>> {
+        Rc::clone(&self.choice_options)
+    }
 }
 
 impl Interaction for ScriptedInteraction {
@@ -95,7 +103,10 @@ impl Interaction for ScriptedInteraction {
     }
 
     /// Returns the next scripted menu selection.
-    fn choose(&mut self, _prompt: &str, _options: &[&str]) -> Result<usize, InteractionError> {
+    fn choose(&mut self, _prompt: &str, options: &[&str]) -> Result<usize, InteractionError> {
+        self.choice_options
+            .borrow_mut()
+            .push(options.iter().map(|option| (*option).to_owned()).collect());
         self.choices
             .pop_front()
             .ok_or_else(|| InteractionError::new("no scripted choice available"))
@@ -106,6 +117,20 @@ impl Interaction for ScriptedInteraction {
         self.messages.borrow_mut().push(message.to_owned());
         Ok(())
     }
+}
+
+/// Writes an encrypted Vault fixture containing the supplied Credential entries.
+fn write_vault_with_credentials(
+    path: &Path,
+    master_password: &str,
+    credentials: impl IntoIterator<Item = Credential>,
+) {
+    let mut vault = Vault::new(master_password).expect("vault should be generated");
+    for credential in credentials {
+        vault.upsert_credential(credential);
+    }
+    let bytes = vault.to_bytes().expect("vault should be encoded");
+    std::fs::write(path, bytes).expect("vault fixture should be written");
 }
 
 /// Verifies that initialization persists an encrypted Vault at a custom path.
@@ -810,6 +835,112 @@ fn get_can_be_cancelled_without_mutating_the_vault() {
     assert_eq!(
         std::fs::read(&path).expect("vault should remain readable"),
         bytes_before_get
+    );
+}
+
+/// Verifies that fuzzy Get ranks candidates and caps the selection at three Keys.
+#[test]
+fn get_fuzzy_suggestions_are_ranked_and_limited_to_three() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("fuzzy-ranking.vault");
+    let master_password = "fuzzy ranking password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [
+            Credential::new("youtube-help", "help", "help value"),
+            Credential::new("youtub", "short", "short value"),
+            Credential::new("youtube-old", "old", "old value"),
+            Credential::new("youtubee", "extended", "extended value"),
+        ],
+    );
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube"])
+        .with_choices([1, 1, 2]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("fuzzy Get should return the selected Credential");
+
+    assert_eq!(
+        choice_options.borrow()[1],
+        [
+            "youtub".to_owned(),
+            "youtubee".to_owned(),
+            "youtube-old".to_owned(),
+            "Cancel".to_owned(),
+        ]
+    );
+    assert_eq!(
+        messages.borrow().last().map(String::as_str),
+        Some("Key: youtubee\nName: extended\nValue: extended value")
+    );
+}
+
+/// Verifies that cancelling fuzzy Get does not display or persist a candidate.
+#[test]
+fn get_fuzzy_suggestions_can_be_cancelled_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("fuzzy-cancel.vault");
+    let master_password = "fuzzy cancellation password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_get = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtub"])
+        .with_choices([1, 1, 2]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("cancelling fuzzy Get should return to the menu");
+
+    assert_eq!(choice_options.borrow()[1], ["youtube", "Cancel"]);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Credential entry not found."]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_get
+    );
+}
+
+/// Verifies that a query without useful candidates can retry and then select a suggestion.
+#[test]
+fn get_without_useful_candidates_can_retry() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("fuzzy-retry.vault");
+    let master_password = "fuzzy retry password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["unrelated", "youtub"])
+        .with_choices([1, 0, 0, 2]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("retrying fuzzy Get should return the selected Credential");
+
+    assert_eq!(choice_options.borrow()[1], ["Retry", "Cancel"]);
+    assert_eq!(choice_options.borrow()[2], ["youtube", "Cancel"]);
+    assert_eq!(
+        messages.borrow().last().map(String::as_str),
+        Some("Key: youtube\nName: alice\nValue: secret value")
     );
 }
 
