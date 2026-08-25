@@ -279,6 +279,19 @@ impl Vault {
             false
         }
     }
+
+    /// Removes and returns the first Credential entry whose normalized Key matches `query`.
+    ///
+    /// Returns `None` when the Vault has no matching Credential entry, leaving the Vault unchanged.
+    pub fn remove_credential(&mut self, query: &str) -> Option<Credential> {
+        let normalized_query = normalize_key(query);
+        let index = self
+            .payload
+            .entries
+            .iter()
+            .position(|credential| normalize_key(credential.key()) == normalized_query)?;
+        Some(self.payload.entries.remove(index))
+    }
 }
 
 /// Normalizes a Key for exact matching without changing its stored spelling.
