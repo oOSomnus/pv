@@ -62,6 +62,18 @@ pub trait Interaction {
 
     /// Displays an informational or error message to the user.
     fn message(&mut self, message: &str) -> Result<(), InteractionError>;
+
+    /// Shows a page that remains visible until the user continues, goes Back, or Cancels.
+    ///
+    /// Adapters without a dedicated page interaction display the message and continue.
+    fn display(
+        &mut self,
+        _prompt: &str,
+        message: &str,
+    ) -> Result<InteractionResult<()>, InteractionError> {
+        self.message(message)?;
+        Ok(InteractionResult::Value(()))
+    }
 }
 
 /// Describes a failure while communicating with the interaction adapter.
@@ -233,6 +245,15 @@ pub enum OpenResult {
     Cancelled,
 }
 
+/// Identifies the immediate parent to which a Get detail page returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GetDetailParent {
+    /// The Key lookup page that starts Get.
+    KeyLookup,
+    /// The fuzzy suggestion page and its original query.
+    Suggestions(String),
+}
+
 impl<I: Interaction> App<I> {
     /// Creates an application workflow backed by the supplied interaction adapter.
     pub fn new(interaction: I) -> Self {
@@ -349,7 +370,7 @@ impl<I: Interaction> App<I> {
                 .choose("Vault", &["Add", "Get", "Remove", "Exit"])?;
             match choice {
                 InteractionResult::Value(0) => self.add_credential(path, vault)?,
-                InteractionResult::Value(1) => self.get_credential(vault)?,
+                InteractionResult::Value(1) => self.get_key_lookup(vault)?,
                 InteractionResult::Value(2) => self.remove_credential(path, vault)?,
                 InteractionResult::Value(3)
                 | InteractionResult::Back
@@ -420,10 +441,7 @@ impl<I: Interaction> App<I> {
             self.interaction.message("Credential entry not found.")?;
             let suggestions = vault.find_credential_suggestions(&query);
             if !suggestions.is_empty() {
-                let mut options: Vec<String> = suggestions
-                    .iter()
-                    .map(|credential| credential.key().to_owned())
-                    .collect();
+                let mut options = Self::credential_suggestion_options(&suggestions);
                 options.push("Cancel".to_owned());
                 let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
                 let choice = self
@@ -617,23 +635,108 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Looks up and displays one Credential, offering explicit fuzzy matches when needed.
-    fn get_credential(&mut self, vault: &Vault) -> Result<(), AppError> {
-        if let Some(credential) = self.resolve_credential(vault)? {
-            self.display_credential(credential)?;
+    /// Reads a Key query and routes exact, fuzzy, and missing results to their child pages.
+    fn get_key_lookup(&mut self, vault: &Vault) -> Result<(), AppError> {
+        let query = match self.interaction.input("Key")? {
+            InteractionResult::Value(query) => query,
+            InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
+        };
+
+        if let Some(credential) = vault.find_credential(&query) {
+            return self.get_detail_page(vault, credential, GetDetailParent::KeyLookup);
         }
-        Ok(())
+
+        self.interaction.message("Credential entry not found.")?;
+        let suggestions = vault.find_credential_suggestions(&query);
+        if suggestions.is_empty() {
+            self.get_retry_page(vault)
+        } else {
+            self.get_suggestions_page(vault, query, suggestions)
+        }
     }
 
-    /// Displays a Credential's Key, Name, and Value through the interaction adapter.
-    fn display_credential(&mut self, credential: &Credential) -> Result<(), AppError> {
-        self.interaction.message(&format!(
-            "Key: {}\nName: {}\nValue: {}",
-            credential.key(),
-            credential.name(),
-            credential.value()
-        ))?;
-        Ok(())
+    /// Presents fuzzy Key suggestions and returns Back to the preceding Key lookup page.
+    fn get_suggestions_page(
+        &mut self,
+        vault: &Vault,
+        query: String,
+        suggestions: Vec<&Credential>,
+    ) -> Result<(), AppError> {
+        let mut options = Self::credential_suggestion_options(&suggestions);
+        options.push("Cancel".to_owned());
+        let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
+        let choice = self
+            .interaction
+            .choose("Credential suggestions", &option_references)?;
+        match choice {
+            InteractionResult::Value(choice) if choice < suggestions.len() => self.get_detail_page(
+                vault,
+                suggestions[choice],
+                GetDetailParent::Suggestions(query),
+            ),
+            InteractionResult::Value(choice) if choice == suggestions.len() => Ok(()),
+            InteractionResult::Back => self.get_key_lookup(vault),
+            InteractionResult::Cancel => Ok(()),
+            InteractionResult::Value(_) => {
+                self.interaction.message(
+                    "Invalid Credential suggestion selection. Choose a suggestion, Back, or Cancel.",
+                )?;
+                self.get_suggestions_page(vault, query, suggestions)
+            }
+        }
+    }
+
+    /// Presents retry feedback for a missing Key and returns Back to Key lookup.
+    fn get_retry_page(&mut self, vault: &Vault) -> Result<(), AppError> {
+        let choice = self
+            .interaction
+            .choose("Credential not found", &["Retry", "Cancel"])?;
+        match choice {
+            InteractionResult::Value(0) | InteractionResult::Back => self.get_key_lookup(vault),
+            InteractionResult::Value(1) | InteractionResult::Cancel => Ok(()),
+            InteractionResult::Value(_) => {
+                self.interaction
+                    .message("Invalid retry selection. Choose Retry, Back, or Cancel.")?;
+                self.get_retry_page(vault)
+            }
+        }
+    }
+
+    /// Displays a Credential and routes Continue or Cancel to Vault Home, or Back to its parent.
+    fn get_detail_page(
+        &mut self,
+        vault: &Vault,
+        credential: &Credential,
+        parent: GetDetailParent,
+    ) -> Result<(), AppError> {
+        let navigation = self.interaction.display(
+            "Credential entry",
+            &format!(
+                "Key: {}\nName: {}\nValue: {}",
+                credential.key(),
+                credential.name(),
+                credential.value()
+            ),
+        )?;
+
+        match navigation {
+            InteractionResult::Value(()) | InteractionResult::Cancel => Ok(()),
+            InteractionResult::Back => match parent {
+                GetDetailParent::KeyLookup => self.get_key_lookup(vault),
+                GetDetailParent::Suggestions(query) => {
+                    let suggestions = vault.find_credential_suggestions(&query);
+                    self.get_suggestions_page(vault, query, suggestions)
+                }
+            },
+        }
+    }
+
+    /// Builds the visible Key options used by a fuzzy Credential suggestion page.
+    fn credential_suggestion_options(suggestions: &[&Credential]) -> Vec<String> {
+        suggestions
+            .iter()
+            .map(|credential| credential.key().to_owned())
+            .collect()
     }
 
     /// Encrypts and synchronizes the current Vault at its existing path.
