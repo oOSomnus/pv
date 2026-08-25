@@ -271,6 +271,16 @@ enum ManualDraftOutcome {
     Completed,
 }
 
+/// Describes the result of the shared duplicate-aware Credential save operation.
+enum CredentialSaveOutcome {
+    /// The Credential was upserted and persisted successfully.
+    Saved,
+    /// The user returned to the pending Credential without changing the Vault.
+    Back,
+    /// The user cancelled the save without changing the Vault.
+    Cancelled,
+}
+
 /// Describes how an open Vault session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenResult {
@@ -607,34 +617,19 @@ impl<I: Interaction> App<I> {
                                 draft.name.clone(),
                                 draft.value.clone(),
                             );
-                            if vault.find_credential(credential.key()).is_some() {
-                                self.interaction
-                                    .message("A Credential entry with that Key already exists.")?;
-                                let duplicate_choice = self
-                                    .interaction
-                                    .choose("Duplicate Key", &["Overwrite", "Back"])?;
-                                match duplicate_choice {
-                                    InteractionResult::Value(0) => {}
-                                    InteractionResult::Value(1) | InteractionResult::Back => {
-                                        step = ManualDraftStep::Review;
-                                        continue;
-                                    }
-                                    InteractionResult::Cancel => {
-                                        return Ok(ManualDraftOutcome::Completed);
-                                    }
-                                    InteractionResult::Value(choice) => {
-                                        return Err(AppError::InvalidChoice {
-                                            prompt: "Duplicate Key",
-                                            choice,
-                                        });
-                                    }
+                            match self.save_credential(path, vault, credential, "Back")? {
+                                CredentialSaveOutcome::Saved => {
+                                    self.interaction.message("Credential entry saved.")?;
+                                    return Ok(ManualDraftOutcome::Completed);
+                                }
+                                CredentialSaveOutcome::Back => {
+                                    step = ManualDraftStep::Review;
+                                    continue;
+                                }
+                                CredentialSaveOutcome::Cancelled => {
+                                    return Ok(ManualDraftOutcome::Completed);
                                 }
                             }
-
-                            vault.upsert_credential(credential);
-                            Self::persist(path, vault)?;
-                            self.interaction.message("Credential entry saved.")?;
-                            return Ok(ManualDraftOutcome::Completed);
                         }
                         InteractionResult::Value(1) | InteractionResult::Back => {
                             step = ManualDraftStep::Value;
@@ -670,17 +665,33 @@ impl<I: Interaction> App<I> {
         };
         let credential = Credential::new(key, name, value);
 
+        match self.save_credential(path, vault, credential, "Cancel")? {
+            CredentialSaveOutcome::Saved
+            | CredentialSaveOutcome::Back
+            | CredentialSaveOutcome::Cancelled => Ok(()),
+        }
+    }
+
+    /// Resolves a duplicate Key and persists `credential` only after an explicit save decision.
+    fn save_credential(
+        &mut self,
+        path: &Path,
+        vault: &mut Vault,
+        credential: Credential,
+        duplicate_return_label: &'static str,
+    ) -> Result<CredentialSaveOutcome, AppError> {
         if vault.find_credential(credential.key()).is_some() {
             self.interaction
                 .message("A Credential entry with that Key already exists.")?;
             let choice = self
                 .interaction
-                .choose("Duplicate Key", &["Overwrite", "Cancel"])?;
+                .choose("Duplicate Key", &["Overwrite", duplicate_return_label])?;
             match choice {
                 InteractionResult::Value(0) => {}
-                InteractionResult::Value(1)
-                | InteractionResult::Back
-                | InteractionResult::Cancel => return Ok(()),
+                InteractionResult::Value(1) | InteractionResult::Back => {
+                    return Ok(CredentialSaveOutcome::Back);
+                }
+                InteractionResult::Cancel => return Ok(CredentialSaveOutcome::Cancelled),
                 InteractionResult::Value(choice) => {
                     return Err(AppError::InvalidChoice {
                         prompt: "Duplicate Key",
@@ -691,7 +702,8 @@ impl<I: Interaction> App<I> {
         }
 
         vault.upsert_credential(credential);
-        Self::persist(path, vault)
+        Self::persist(path, vault)?;
+        Ok(CredentialSaveOutcome::Saved)
     }
 
     /// Collects Generated value options and lets the user review each generated value.
