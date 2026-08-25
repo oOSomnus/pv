@@ -254,13 +254,14 @@ impl TuiInteraction {
         }
     }
 
-    /// Reads a keyboard-selected option from the supplied menu.
+    /// Reads a keyboard-selected option while keeping a message on the same page.
     ///
     /// Returns an [`InteractionError`] when `options` is empty or terminal rendering/event
     /// reading fails.
-    fn read_choice(
+    fn read_choice_page(
         &mut self,
         prompt: &str,
+        message: &str,
         options: &[&str],
     ) -> Result<InteractionResult<usize>, InteractionError> {
         if options.is_empty() {
@@ -268,17 +269,21 @@ impl TuiInteraction {
         }
         let mut selected = 0;
         loop {
-            let body: Vec<String> = options
-                .iter()
-                .enumerate()
-                .map(|(index, option)| {
-                    if index == selected {
-                        format!("› {option}")
-                    } else {
-                        format!("  {option}")
-                    }
-                })
-                .collect();
+            let mut body: Vec<String> = if message.is_empty() {
+                Vec::new()
+            } else {
+                message.split('\n').map(str::to_owned).collect()
+            };
+            if !body.is_empty() {
+                body.push(String::new());
+            }
+            body.extend(options.iter().enumerate().map(|(index, option)| {
+                if index == selected {
+                    format!("› {option}")
+                } else {
+                    format!("  {option}")
+                }
+            }));
             self.draw(
                 prompt,
                 &body,
@@ -388,7 +393,17 @@ impl Interaction for TuiInteraction {
         prompt: &str,
         options: &[&str],
     ) -> Result<InteractionResult<usize>, InteractionError> {
-        self.read_choice(prompt, options)
+        self.read_choice_page(prompt, "", options)
+    }
+
+    /// Shows a masked candidate and its actions on one refreshable terminal page.
+    fn choose_page(
+        &mut self,
+        prompt: &str,
+        message: &str,
+        options: &[&str],
+    ) -> Result<InteractionResult<usize>, InteractionError> {
+        self.read_choice_page(prompt, message, options)
     }
 
     /// Shows a status message in the shared shell without blocking the workflow.
