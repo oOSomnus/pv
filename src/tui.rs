@@ -75,6 +75,7 @@ impl TuiInteraction {
                 "Unlock Vault"
             }
             TuiWorkflow::Open if prompt == "Vault" => "Vault Home",
+            TuiWorkflow::Open if prompt == "Credential entry" => "Credential entry",
             TuiWorkflow::Open => "Vault",
         }
     }
@@ -317,6 +318,39 @@ impl TuiInteraction {
             }
         }
     }
+
+    /// Reads navigation for a page whose body remains visible while the user decides where to go.
+    fn read_page(
+        &mut self,
+        prompt: &str,
+        body: &[String],
+    ) -> Result<InteractionResult<()>, InteractionError> {
+        loop {
+            self.draw(prompt, body, "Enter Continue   Esc Back   Ctrl+C Cancel")?;
+
+            match event::read().map_err(Self::terminal_error)? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if is_cancel_key(key) {
+                        self.status = None;
+                        return Ok(InteractionResult::Cancel);
+                    }
+                    match key.code {
+                        KeyCode::Enter => {
+                            self.status = None;
+                            return Ok(InteractionResult::Value(()));
+                        }
+                        KeyCode::Esc => {
+                            self.status = None;
+                            return Ok(InteractionResult::Back);
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
+            }
+        }
+    }
 }
 
 impl Interaction for TuiInteraction {
@@ -361,6 +395,15 @@ impl Interaction for TuiInteraction {
     fn message(&mut self, message: &str) -> Result<(), InteractionError> {
         self.status = Some(message.to_owned());
         self.draw("Status", &[], "Enter Continue   Esc Back   Ctrl+C Cancel")
+    }
+
+    /// Displays a complete Credential page and returns its navigation action.
+    fn display(
+        &mut self,
+        prompt: &str,
+        message: &str,
+    ) -> Result<InteractionResult<()>, InteractionError> {
+        self.read_page(prompt, &[message.to_owned()])
     }
 }
 

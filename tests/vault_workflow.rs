@@ -22,12 +22,14 @@ struct UnsupportedEnvelope {
 
 /// Scripted interaction adapter used to drive workflow tests deterministically.
 struct ScriptedInteraction {
-    /// Passwords returned in prompt order.
+    /// Passwords or navigation results returned in prompt order.
     passwords: VecDeque<InteractionResult<String>>,
-    /// Text inputs or navigation actions returned in prompt order.
+    /// Text input values or navigation results returned in prompt order.
     inputs: VecDeque<InteractionResult<String>>,
-    /// Menu selections or navigation actions returned in prompt order.
+    /// Menu selections or navigation results returned in prompt order.
     choices: VecDeque<InteractionResult<usize>>,
+    /// Detail-page navigation results returned in prompt order.
+    display_results: VecDeque<InteractionResult<()>>,
     /// Messages emitted by the workflow.
     messages: Rc<RefCell<Vec<String>>>,
     /// Prompts that requested hidden password input.
@@ -48,6 +50,7 @@ impl ScriptedInteraction {
                 .collect(),
             inputs: VecDeque::new(),
             choices: VecDeque::new(),
+            display_results: VecDeque::new(),
             messages: Rc::new(RefCell::new(Vec::new())),
             password_prompts: Rc::new(RefCell::new(Vec::new())),
             input_prompts: Rc::new(RefCell::new(Vec::new())),
@@ -61,6 +64,15 @@ impl ScriptedInteraction {
             .into_iter()
             .map(|input| InteractionResult::Value(input.into()))
             .collect();
+        self
+    }
+
+    /// Adds scripted visible text results, including Back and Cancel actions.
+    fn with_input_results(
+        mut self,
+        inputs: impl IntoIterator<Item = InteractionResult<String>>,
+    ) -> Self {
+        self.inputs = inputs.into_iter().collect();
         self
     }
 
@@ -79,21 +91,21 @@ impl ScriptedInteraction {
         self
     }
 
-    /// Adds text-input results that may include renderer-neutral navigation actions.
-    fn with_input_results(
-        mut self,
-        inputs: impl IntoIterator<Item = InteractionResult<String>>,
-    ) -> Self {
-        self.inputs = inputs.into_iter().collect();
-        self
-    }
-
     /// Adds menu selections and navigation results to this adapter.
     fn with_choice_results(
         mut self,
         choices: impl IntoIterator<Item = InteractionResult<usize>>,
     ) -> Self {
         self.choices = choices.into_iter().collect();
+        self
+    }
+
+    /// Adds scripted Credential detail-page navigation results.
+    fn with_display_results(
+        mut self,
+        results: impl IntoIterator<Item = InteractionResult<()>>,
+    ) -> Self {
+        self.display_results = results.into_iter().collect();
         self
     }
 
@@ -127,7 +139,7 @@ impl Interaction for ScriptedInteraction {
             .ok_or_else(|| InteractionError::new("no scripted password available"))
     }
 
-    /// Returns the next scripted visible text response.
+    /// Returns the next scripted visible text value or navigation result.
     fn input(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError> {
         self.input_prompts.borrow_mut().push(prompt.to_owned());
         self.inputs
@@ -135,7 +147,7 @@ impl Interaction for ScriptedInteraction {
             .ok_or_else(|| InteractionError::new("no scripted input available"))
     }
 
-    /// Returns the next scripted menu selection.
+    /// Returns the next scripted menu selection or navigation result.
     fn choose(
         &mut self,
         _prompt: &str,
@@ -153,6 +165,19 @@ impl Interaction for ScriptedInteraction {
     fn message(&mut self, message: &str) -> Result<(), InteractionError> {
         self.messages.borrow_mut().push(message.to_owned());
         Ok(())
+    }
+
+    /// Records a Credential detail page and returns its scripted navigation result.
+    fn display(
+        &mut self,
+        _prompt: &str,
+        message: &str,
+    ) -> Result<InteractionResult<()>, InteractionError> {
+        self.messages.borrow_mut().push(message.to_owned());
+        Ok(self
+            .display_results
+            .pop_front()
+            .unwrap_or(InteractionResult::Value(())))
     }
 }
 
@@ -1113,6 +1138,304 @@ fn get_without_useful_candidates_can_retry() {
     assert_eq!(
         messages.borrow().last().map(String::as_str),
         Some("Key: youtube\nName: alice\nValue: secret value")
+    );
+}
+
+/// Verifies that Back from a Get detail page returns to its fuzzy suggestion parent.
+#[test]
+fn get_back_from_detail_returns_to_fuzzy_suggestions() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-detail-back.vault");
+    let master_password = "get detail back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [
+            Credential::new("youtube", "alice", "youtube value"),
+            Credential::new("youtube-help", "support", "help value"),
+        ],
+    );
+    let bytes_before_get = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtub"])
+        .with_choices([1, 0, 1, 3])
+        .with_display_results([InteractionResult::Back, InteractionResult::Value(())]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("returning from Get detail should preserve the Vault session");
+
+    assert_eq!(
+        choice_options.borrow().as_slice(),
+        vec![
+            vec!["Add", "Get", "Remove", "Exit"],
+            vec!["youtube", "youtube-help", "Cancel"],
+            vec!["youtube", "youtube-help", "Cancel"],
+            vec!["Add", "Get", "Remove", "Exit"],
+        ]
+    );
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Credential entry not found.",
+            "Key: youtube\nName: alice\nValue: youtube value",
+            "Key: youtube-help\nName: support\nValue: help value",
+        ]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("Vault should remain readable"),
+        bytes_before_get
+    );
+}
+
+/// Verifies that Back from an exact Credential detail page returns to Key lookup.
+#[test]
+fn get_back_from_exact_detail_returns_to_key_lookup() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-exact-detail-back.vault");
+    let master_password = "get exact detail back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_get = std::fs::read(&path).expect("vault should be readable");
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube", "youtube"])
+        .with_choices([1, 3])
+        .with_display_results([InteractionResult::Back, InteractionResult::Value(())]);
+    let input_prompts = interaction.input_prompt_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Back from exact detail should return to Key lookup");
+
+    assert_eq!(input_prompts.borrow().as_slice(), ["Key", "Key"]);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Key: youtube\nName: alice\nValue: secret value",
+            "Key: youtube\nName: alice\nValue: secret value",
+        ]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("Vault should remain readable"),
+        bytes_before_get
+    );
+}
+
+/// Verifies that Back from fuzzy suggestions returns to Key lookup before a new query.
+#[test]
+fn get_back_from_suggestions_returns_to_key_lookup() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-suggestions-back.vault");
+    let master_password = "get suggestions back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let input_prompts = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtub", "youtube"])
+        .with_choice_results([
+            InteractionResult::Value(1),
+            InteractionResult::Back,
+            InteractionResult::Value(3),
+        ]);
+    let input_prompt_log = input_prompts.input_prompt_log();
+    let messages = input_prompts.message_log();
+    let mut app = App::new(input_prompts);
+
+    app.open(&path)
+        .expect("Back from suggestions should return to Key lookup");
+
+    assert_eq!(input_prompt_log.borrow().as_slice(), ["Key", "Key"]);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Credential entry not found.",
+            "Key: youtube\nName: alice\nValue: secret value"
+        ]
+    );
+}
+
+/// Verifies that Back from a failed-query retry page returns to Key lookup.
+#[test]
+fn get_back_from_retry_returns_to_key_lookup() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-retry-back.vault");
+    let master_password = "get retry back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["unrelated", "youtube"])
+        .with_choice_results([
+            InteractionResult::Value(1),
+            InteractionResult::Back,
+            InteractionResult::Value(3),
+        ]);
+    let input_prompts = interaction.input_prompt_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Back from retry should return to Key lookup");
+
+    assert_eq!(input_prompts.borrow().as_slice(), ["Key", "Key"]);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Credential entry not found.",
+            "Key: youtube\nName: alice\nValue: secret value"
+        ]
+    );
+}
+
+/// Verifies that Back from the initial Key page returns to Vault Home.
+#[test]
+fn get_back_from_key_lookup_returns_to_vault_home() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-key-back.vault");
+    let master_password = "get key back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_get = std::fs::read(&path).expect("vault should be readable");
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([InteractionResult::Back])
+        .with_choices([1, 3]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Back from Key lookup should return to Vault Home");
+
+    assert!(messages.borrow().is_empty());
+    assert_eq!(
+        std::fs::read(&path).expect("Vault should remain readable"),
+        bytes_before_get
+    );
+}
+
+/// Verifies that Cancel from Credential detail abandons Get without mutating the Vault.
+#[test]
+fn get_cancel_from_detail_returns_to_vault_home_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-detail-cancel.vault");
+    let master_password = "get detail cancel password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_get = std::fs::read(&path).expect("vault should be readable");
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube"])
+        .with_choices([1, 3])
+        .with_display_results([InteractionResult::Cancel]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Cancel from detail should return to Vault Home");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Key: youtube\nName: alice\nValue: secret value"]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("Vault should remain readable"),
+        bytes_before_get
+    );
+}
+
+/// Verifies that an invalid fuzzy selection is reported and the suggestion page can be retried.
+#[test]
+fn get_invalid_fuzzy_selection_can_be_retried_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-invalid-suggestion.vault");
+    let master_password = "get invalid suggestion password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_get = std::fs::read(&path).expect("vault should be readable");
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtub"])
+        .with_choice_results([
+            InteractionResult::Value(1),
+            InteractionResult::Value(99),
+            InteractionResult::Value(0),
+            InteractionResult::Value(3),
+        ]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("an invalid suggestion should return to the suggestion page");
+
+    assert_eq!(choice_options.borrow().len(), 4);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Credential entry not found.",
+            "Invalid Credential suggestion selection. Choose a suggestion, Back, or Cancel.",
+            "Key: youtube\nName: alice\nValue: secret value",
+        ]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("Vault should remain readable"),
+        bytes_before_get
+    );
+}
+
+/// Verifies that an invalid retry selection is reported before Cancel returns to Vault Home.
+#[test]
+fn get_invalid_retry_selection_can_be_cancelled_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-invalid-retry.vault");
+    let master_password = "get invalid retry password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_get = std::fs::read(&path).expect("vault should be readable");
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["unrelated"])
+        .with_choice_results([
+            InteractionResult::Value(1),
+            InteractionResult::Value(99),
+            InteractionResult::Cancel,
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("an invalid retry selection should remain recoverable");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Credential entry not found.",
+            "Invalid retry selection. Choose Retry, Back, or Cancel.",
+        ]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("Vault should remain readable"),
+        bytes_before_get
     );
 }
 

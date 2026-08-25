@@ -78,6 +78,18 @@ pub trait Interaction {
 
     /// Displays an informational or error message to the user.
     fn message(&mut self, message: &str) -> Result<(), InteractionError>;
+
+    /// Shows a page that remains visible until the user continues, goes Back, or Cancels.
+    ///
+    /// Adapters without a dedicated page interaction display the message and continue.
+    fn display(
+        &mut self,
+        _prompt: &str,
+        message: &str,
+    ) -> Result<InteractionResult<()>, InteractionError> {
+        self.message(message)?;
+        Ok(InteractionResult::Value(()))
+    }
 }
 
 /// Describes a failure while communicating with the interaction adapter.
@@ -302,6 +314,15 @@ enum CredentialResolution<'vault> {
         /// The fuzzy candidates displayed before the selection.
         candidates: Vec<&'vault Credential>,
     },
+}
+
+/// Identifies the immediate parent to which a Get detail page returns.
+#[derive(Debug)]
+enum GetDetailParent<'vault> {
+    /// Returns to the initial Key lookup page.
+    KeyLookup,
+    /// Returns to the retained fuzzy candidate selection page.
+    Suggestions(Vec<&'vault Credential>),
 }
 
 /// Copies the non-secret context shown while confirming Credential entry removal.
@@ -627,10 +648,7 @@ impl<I: Interaction> App<I> {
             self.interaction.message("Credential entry not found.")?;
             let suggestions = vault.find_credential_suggestions(&query);
             if !suggestions.is_empty() {
-                let options: Vec<String> = suggestions
-                    .iter()
-                    .map(|credential| credential.key().to_owned())
-                    .collect();
+                let options = Self::credential_suggestion_options(&suggestions);
                 match self.choose_credential_candidate(&options)? {
                     InteractionResult::Value(choice) => {
                         return Ok(Some(CredentialResolution::Fuzzy {
@@ -643,9 +661,21 @@ impl<I: Interaction> App<I> {
                 }
             }
 
-            let choice = self
-                .interaction
-                .choose("Credential not found", &["Retry", "Cancel"])?;
+            let choice = loop {
+                let choice = self
+                    .interaction
+                    .choose("Credential not found", &["Retry", "Cancel"])?;
+                match choice {
+                    InteractionResult::Value(0)
+                    | InteractionResult::Value(1)
+                    | InteractionResult::Back
+                    | InteractionResult::Cancel => break choice,
+                    InteractionResult::Value(_) => {
+                        self.interaction
+                            .message("Invalid retry selection. Choose Retry, Back, or Cancel.")?;
+                    }
+                }
+            };
             match choice {
                 InteractionResult::Value(0) => {}
                 InteractionResult::Value(1) | InteractionResult::Cancel => return Ok(None),
@@ -660,30 +690,33 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Presents fuzzy Key candidates and maps the explicit Cancel option to navigation.
+    /// Presents fuzzy Key candidates and maps navigation actions to workflow results.
     fn choose_credential_candidate(
         &mut self,
         candidates: &[String],
     ) -> Result<InteractionResult<usize>, AppError> {
-        let mut options = candidates.to_owned();
-        options.push("Cancel".to_owned());
-        let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
-        let choice = self
-            .interaction
-            .choose("Credential suggestions", &option_references)?;
-        match choice {
-            InteractionResult::Value(choice) if choice < candidates.len() => {
-                Ok(InteractionResult::Value(choice))
+        loop {
+            let mut options = candidates.to_owned();
+            options.push("Cancel".to_owned());
+            let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
+            let choice = self
+                .interaction
+                .choose("Credential suggestions", &option_references)?;
+            match choice {
+                InteractionResult::Value(choice) if choice < candidates.len() => {
+                    return Ok(InteractionResult::Value(choice));
+                }
+                InteractionResult::Value(choice) if choice == candidates.len() => {
+                    return Ok(InteractionResult::Cancel);
+                }
+                InteractionResult::Back => return Ok(InteractionResult::Back),
+                InteractionResult::Cancel => return Ok(InteractionResult::Cancel),
+                InteractionResult::Value(_) => {
+                    self.interaction.message(
+                        "Invalid Credential suggestion selection. Choose a suggestion, Back, or Cancel.",
+                    )?;
+                }
             }
-            InteractionResult::Value(choice) if choice == candidates.len() => {
-                Ok(InteractionResult::Cancel)
-            }
-            InteractionResult::Back => Ok(InteractionResult::Back),
-            InteractionResult::Cancel => Ok(InteractionResult::Cancel),
-            InteractionResult::Value(choice) => Err(AppError::InvalidChoice {
-                prompt: "Credential suggestions",
-                choice,
-            }),
         }
     }
 
@@ -964,27 +997,72 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Looks up and displays one Credential, offering explicit fuzzy matches when needed.
+    /// Looks up and displays one Credential through the reversible Get page hierarchy.
     fn get_credential(&mut self, vault: &Vault) -> Result<(), AppError> {
-        if let Some(resolution) = self.resolve_credential(vault)? {
-            let credential = match resolution {
-                CredentialResolution::Exact(credential)
-                | CredentialResolution::Fuzzy { credential, .. } => credential,
-            };
-            self.display_credential(credential)?;
-        }
-        Ok(())
+        let Some(resolution) = self.resolve_credential(vault)? else {
+            return Ok(());
+        };
+        let (credential, parent) = match resolution {
+            CredentialResolution::Exact(credential) => (credential, GetDetailParent::KeyLookup),
+            CredentialResolution::Fuzzy {
+                credential,
+                candidates,
+            } => (credential, GetDetailParent::Suggestions(candidates)),
+        };
+        self.get_detail_page(vault, credential, parent)
     }
 
-    /// Displays a Credential's Key, Name, and Value through the interaction adapter.
-    fn display_credential(&mut self, credential: &Credential) -> Result<(), AppError> {
-        self.interaction.message(&format!(
-            "Key: {}\nName: {}\nValue: {}",
-            credential.key(),
-            credential.name(),
-            credential.value()
-        ))?;
-        Ok(())
+    /// Presents retained fuzzy Keys and routes Back to a fresh Key lookup.
+    fn get_suggestions_page<'vault>(
+        &mut self,
+        vault: &'vault Vault,
+        suggestions: Vec<&'vault Credential>,
+    ) -> Result<(), AppError> {
+        let options = Self::credential_suggestion_options(&suggestions);
+        match self.choose_credential_candidate(&options)? {
+            InteractionResult::Value(choice) => {
+                let credential = suggestions[choice];
+                self.get_detail_page(vault, credential, GetDetailParent::Suggestions(suggestions))
+            }
+            InteractionResult::Back => self.get_credential(vault),
+            InteractionResult::Cancel => Ok(()),
+        }
+    }
+
+    /// Displays a Credential and routes Continue or Cancel to Vault Home, or Back to its parent.
+    fn get_detail_page<'vault>(
+        &mut self,
+        vault: &'vault Vault,
+        credential: &'vault Credential,
+        parent: GetDetailParent<'vault>,
+    ) -> Result<(), AppError> {
+        let navigation = self.interaction.display(
+            "Credential entry",
+            &format!(
+                "Key: {}\nName: {}\nValue: {}",
+                credential.key(),
+                credential.name(),
+                credential.value()
+            ),
+        )?;
+
+        match navigation {
+            InteractionResult::Value(()) | InteractionResult::Cancel => Ok(()),
+            InteractionResult::Back => match parent {
+                GetDetailParent::KeyLookup => self.get_credential(vault),
+                GetDetailParent::Suggestions(suggestions) => {
+                    self.get_suggestions_page(vault, suggestions)
+                }
+            },
+        }
+    }
+
+    /// Builds the visible Key options used by a fuzzy Credential suggestion page.
+    fn credential_suggestion_options(suggestions: &[&Credential]) -> Vec<String> {
+        suggestions
+            .iter()
+            .map(|credential| credential.key().to_owned())
+            .collect()
     }
 
     /// Encrypts and synchronizes the current Vault at its existing path.
