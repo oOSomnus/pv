@@ -62,6 +62,7 @@ fn open_can_cancel_from_the_interaction_contract_without_mutating_the_vault() {
 
 /// Adapter that records the selected home-page options and cancels the session.
 struct CancelAtHome {
+    /// Menu option lists recorded from the Vault home.
     options: Rc<RefCell<Vec<Vec<String>>>>,
 }
 

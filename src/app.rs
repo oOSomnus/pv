@@ -227,9 +227,9 @@ pub struct App<I> {
 /// Describes how an open Vault session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenResult {
-    /// The user selected Exit from the open Vault menu.
+    /// The user selected Exit or a root-level navigation action from the Vault home.
     Exited,
-    /// The user cancelled after an incorrect password.
+    /// The user cancelled or returned from the unlock workflow.
     Cancelled,
 }
 

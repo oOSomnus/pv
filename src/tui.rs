@@ -37,6 +37,8 @@ pub struct TuiInteraction {
 
 impl TuiInteraction {
     /// Enters a raw alternate-screen terminal session for `workflow`.
+    ///
+    /// Returns an [`InteractionError`] when raw mode or alternate-screen setup fails.
     pub fn new(workflow: TuiWorkflow) -> Result<Self, InteractionError> {
         terminal::enable_raw_mode().map_err(Self::terminal_error)?;
         let mut output = io::stdout();
@@ -47,6 +49,7 @@ impl TuiInteraction {
             Clear(ClearType::All),
             Hide
         ) {
+            let _ = execute!(output, ResetColor, Show, LeaveAlternateScreen);
             let _ = terminal::disable_raw_mode();
             return Err(Self::terminal_error(error));
         }
@@ -95,6 +98,8 @@ impl TuiInteraction {
     }
 
     /// Draws the shared title, context, status bar, body, and footer shell.
+    ///
+    /// Returns an [`InteractionError`] when terminal sizing, rendering, or flushing fails.
     fn draw(
         &mut self,
         prompt: &str,
@@ -111,9 +116,11 @@ impl TuiInteraction {
         let divider = "─".repeat(usize::from(width.max(1)));
         let mut lines = Vec::with_capacity(body.len() + 1);
         if let Some(status) = &self.status {
-            lines.push(format!("! {status}"));
+            lines.extend(status.split('\n').map(|line| format!("! {line}")));
         }
-        lines.extend(body.iter().cloned());
+        for body_line in body {
+            lines.extend(body_line.split('\n').map(str::to_owned));
+        }
 
         queue!(
             self.output,
@@ -152,7 +159,11 @@ impl TuiInteraction {
 
         let status_row = height.saturating_sub(3);
         let footer_row = height.saturating_sub(1);
-        let status_text = self.status.as_deref().unwrap_or("Ready");
+        let status_text = self
+            .status
+            .as_deref()
+            .unwrap_or("Ready")
+            .replace('\n', " · ");
         queue!(
             self.output,
             MoveTo(0, status_row),
@@ -174,6 +185,8 @@ impl TuiInteraction {
     }
 
     /// Reads one editable text value, optionally masking it and applying a default.
+    ///
+    /// Returns an [`InteractionError`] when terminal rendering or event reading fails.
     fn read_text(
         &mut self,
         prompt: &str,
@@ -236,6 +249,9 @@ impl TuiInteraction {
     }
 
     /// Reads a keyboard-selected option from the supplied menu.
+    ///
+    /// Returns an [`InteractionError`] when `options` is empty or terminal rendering/event
+    /// reading fails.
     fn read_choice(
         &mut self,
         prompt: &str,
