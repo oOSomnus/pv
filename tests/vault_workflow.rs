@@ -422,7 +422,7 @@ fn manual_add_is_persisted_and_retrievable_after_reopening() {
 
     let add_interaction = ScriptedInteraction::with_passwords([master_password, "secret value"])
         .with_inputs(["  YouTube  ", "alice"])
-        .with_choices([0, 2]);
+        .with_choices([0, 0, 2]);
     let password_prompts = add_interaction.password_prompt_log();
     let input_prompts = add_interaction.input_prompt_log();
     let mut add_app = App::new(add_interaction);
@@ -459,6 +459,262 @@ fn manual_add_is_persisted_and_retrievable_after_reopening() {
     );
 }
 
+/// Verifies that a confirmed Generated value is persisted and retrievable after reopening.
+#[test]
+fn generated_add_is_persisted_and_retrievable_after_reopening() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("generated-add.vault");
+    let master_password = "generated add master password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let add_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube", "alice", ""])
+        .with_choices([0, 1, 0, 0, 0, 2]);
+    let messages = add_interaction.message_log();
+    let mut add_app = App::new(add_interaction);
+
+    add_app
+        .open(&path)
+        .expect("confirming a Generated value should succeed");
+
+    let generated_value = messages
+        .borrow()
+        .iter()
+        .find_map(|message| message.strip_prefix("Generated value: "))
+        .expect("the generated value should be shown for review")
+        .to_owned();
+    assert_eq!(generated_value.chars().count(), 16);
+    assert!(
+        generated_value
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+    );
+    assert!(
+        generated_value
+            .chars()
+            .any(|character| character.is_ascii_digit())
+    );
+    assert!(
+        generated_value
+            .chars()
+            .any(|character| character.is_ascii_punctuation())
+    );
+
+    let bytes_after_add = std::fs::read(&path).expect("vault should be readable");
+    assert!(
+        !bytes_after_add
+            .windows(generated_value.len())
+            .any(|candidate| candidate == generated_value.as_bytes())
+    );
+
+    let get_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["YOUTUBE"])
+        .with_choices([1, 2]);
+    let get_messages = get_interaction.message_log();
+    let mut get_app = App::new(get_interaction);
+
+    get_app
+        .open(&path)
+        .expect("the Generated value should survive reopening");
+
+    assert_eq!(
+        get_messages.borrow().as_slice(),
+        [format!(
+            "Key: youtube\nName: alice\nValue: {generated_value}"
+        )]
+    );
+}
+
+/// Verifies that invalid Generated value lengths are retried before applying class options.
+#[test]
+fn generated_add_retries_invalid_lengths_and_can_disable_optional_classes() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("generated-options.vault");
+    let master_password = "generated options master password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let add_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube", "alice", "9", "not a number", "10"])
+        .with_choices([0, 1, 1, 1, 0, 2]);
+    let messages = add_interaction.message_log();
+    let mut app = App::new(add_interaction);
+
+    app.open(&path)
+        .expect("valid Generated value options should succeed");
+
+    let messages = messages.borrow();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message.starts_with("Generated value length")
+                    || message.starts_with("generated value length")
+            })
+            .count(),
+        2
+    );
+    let generated_value = messages
+        .iter()
+        .find_map(|message| message.strip_prefix("Generated value: "))
+        .expect("the generated value should be shown for review");
+    assert_eq!(generated_value.chars().count(), 10);
+    assert!(
+        generated_value
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+    );
+}
+
+/// Verifies that regeneration creates a different value with the same selected options.
+#[test]
+fn generated_add_can_regenerate_before_confirming() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("generated-regenerate.vault");
+    let master_password = "generated regeneration master password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let add_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube", "alice", "10"])
+        .with_choices([0, 1, 1, 1, 1, 0, 2]);
+    let messages = add_interaction.message_log();
+    let mut app = App::new(add_interaction);
+
+    app.open(&path)
+        .expect("regenerating and confirming should succeed");
+
+    let generated_values: Vec<String> = messages
+        .borrow()
+        .iter()
+        .filter_map(|message| message.strip_prefix("Generated value: "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(generated_values.len(), 2);
+    assert_ne!(generated_values[0], generated_values[1]);
+    assert!(
+        generated_values
+            .iter()
+            .all(|value| value.chars().count() == 10)
+    );
+    assert!(generated_values.iter().all(|value| {
+        value
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+    }));
+}
+
+/// Verifies that cancelling a Generated value leaves the persisted Vault unchanged.
+#[test]
+fn generated_add_can_be_cancelled_without_mutating_the_vault() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("generated-cancel.vault");
+    let master_password = "generated cancellation master password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let mut app = App::new(
+        ScriptedInteraction::with_passwords([master_password])
+            .with_inputs(["youtube", "alice", "10"])
+            .with_choices([0, 1, 1, 1, 2, 2]),
+    );
+
+    app.open(&path)
+        .expect("cancelling a Generated value should return to the menu");
+
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that a duplicate Generated value can be cancelled or explicitly overwritten.
+#[test]
+fn generated_duplicate_can_be_cancelled_or_overwritten() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("generated-duplicate.vault");
+    let master_password = "generated duplicate master password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let mut original_app = App::new(
+        ScriptedInteraction::with_passwords([master_password, "original secret"])
+            .with_inputs(["YouTube", "original name"])
+            .with_choices([0, 0, 2]),
+    );
+    original_app
+        .open(&path)
+        .expect("the original Credential should be added");
+    let bytes_before_duplicate_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let mut cancel_app = App::new(
+        ScriptedInteraction::with_passwords([master_password])
+            .with_inputs([" youtube ", "discarded name", "10"])
+            .with_choices([0, 1, 1, 1, 0, 1, 2]),
+    );
+    cancel_app
+        .open(&path)
+        .expect("cancelling a duplicate Generated value should return to the menu");
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_duplicate_cancel
+    );
+
+    let overwrite_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["YOUTUBE", "generated name", "10"])
+        .with_choices([0, 1, 1, 1, 0, 0, 2]);
+    let overwrite_messages = overwrite_interaction.message_log();
+    let mut overwrite_app = App::new(overwrite_interaction);
+    overwrite_app
+        .open(&path)
+        .expect("overwriting a duplicate Generated value should succeed");
+
+    let generated_value = overwrite_messages
+        .borrow()
+        .iter()
+        .find_map(|message| message.strip_prefix("Generated value: "))
+        .expect("the generated value should be shown for review")
+        .to_owned();
+
+    let get_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube"])
+        .with_choices([1, 2]);
+    let get_messages = get_interaction.message_log();
+    let mut get_app = App::new(get_interaction);
+    get_app
+        .open(&path)
+        .expect("the overwritten Generated value should survive reopening");
+
+    assert_eq!(
+        get_messages.borrow().as_slice(),
+        [format!(
+            "Key: YouTube\nName: generated name\nValue: {generated_value}"
+        )]
+    );
+}
+
 /// Verifies that a duplicate normalized Key overwrites its Name and Value in place.
 #[test]
 fn duplicate_normalized_key_overwrites_name_and_value() {
@@ -481,7 +737,7 @@ fn duplicate_normalized_key_overwrites_name_and_value() {
                 "second name",
                 "YOUTUBE",
             ])
-            .with_choices([0, 0, 0, 2]);
+            .with_choices([0, 0, 0, 0, 0, 2]);
     let duplicate_messages = add_interaction.message_log();
     let mut add_app = App::new(add_interaction);
 
@@ -526,7 +782,7 @@ fn duplicate_add_can_be_cancelled_without_mutating_the_vault() {
     let mut add_app = App::new(
         ScriptedInteraction::with_passwords([master_password, "original secret"])
             .with_inputs(["YouTube", "original name"])
-            .with_choices([0, 2]),
+            .with_choices([0, 0, 2]),
     );
     add_app
         .open(&path)
@@ -536,7 +792,7 @@ fn duplicate_add_can_be_cancelled_without_mutating_the_vault() {
     let mut cancel_app = App::new(
         ScriptedInteraction::with_passwords([master_password, "discarded secret"])
             .with_inputs([" youtube ", "discarded name"])
-            .with_choices([0, 1, 2]),
+            .with_choices([0, 0, 1, 2]),
     );
 
     cancel_app

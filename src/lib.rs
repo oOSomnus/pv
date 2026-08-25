@@ -4,5 +4,7 @@
 
 /// Interactive command workflows and their interaction adapters.
 pub mod app;
+/// Cryptographically secure Generated value options and generation.
+pub mod generator;
 /// Versioned encrypted Vault serialization and unlocking.
 pub mod vault;

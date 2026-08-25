@@ -10,7 +10,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use dialoguer::{Input, Password, Select};
 use thiserror::Error;
 
-use crate::vault::{Credential, Vault, VaultError};
+use crate::{
+    generator::{self, DEFAULT_LENGTH, GeneratedValueOptions, GeneratorError},
+    vault::{Credential, Vault, VaultError},
+};
 
 /// The Vault path used by the command line when the caller omits a path.
 pub const DEFAULT_VAULT_PATH: &str = "./pv.vault";
@@ -25,6 +28,20 @@ pub trait Interaction {
         Err(InteractionError::new(format!(
             "visible input is unavailable for prompt {prompt}"
         )))
+    }
+
+    /// Reads visible text and supplies `default` when the adapter returns empty text.
+    fn input_with_default(
+        &mut self,
+        prompt: &str,
+        default: &str,
+    ) -> Result<String, InteractionError> {
+        let input = self.input(prompt)?;
+        if input.trim().is_empty() {
+            Ok(default.to_owned())
+        } else {
+            Ok(input)
+        }
     }
 
     /// Presents a menu and returns the selected option index.
@@ -58,6 +75,19 @@ impl Interaction for DialoguerInteraction {
     fn input(&mut self, prompt: &str) -> Result<String, InteractionError> {
         Input::<String>::new()
             .with_prompt(prompt)
+            .interact_text()
+            .map_err(|error| InteractionError::new(error.to_string()))
+    }
+
+    /// Reads visible text with a dialoguer default accepted by pressing Enter.
+    fn input_with_default(
+        &mut self,
+        prompt: &str,
+        default: &str,
+    ) -> Result<String, InteractionError> {
+        Input::<String>::new()
+            .with_prompt(prompt)
+            .default(default.to_owned())
             .interact_text()
             .map_err(|error| InteractionError::new(error.to_string()))
     }
@@ -161,6 +191,10 @@ pub enum AppError {
     /// The Vault envelope or encrypted payload was invalid.
     #[error(transparent)]
     Vault(#[from] VaultError),
+
+    /// A Generated value could not be configured or created.
+    #[error(transparent)]
+    Generator(#[from] GeneratorError),
 }
 
 /// Runs the interactive Vault workflows against an injected interaction adapter.
@@ -293,11 +327,31 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Collects one manual Credential and persists it after duplicate handling.
+    /// Collects one Credential using a manual or Generated value and persists it after duplicate handling.
     fn add_credential(&mut self, path: &Path, vault: &mut Vault) -> Result<(), AppError> {
+        let use_generated_value = match self
+            .interaction
+            .choose("Value type", &["Manual Value", "Generated value"])?
+        {
+            0 => false,
+            1 => true,
+            choice => {
+                return Err(AppError::InvalidChoice {
+                    prompt: "Value type",
+                    choice,
+                });
+            }
+        };
         let key = self.interaction.input("Key")?;
         let name = self.interaction.input("Name")?;
-        let value = self.interaction.password("Value")?;
+        let value = if use_generated_value {
+            match self.generated_value()? {
+                Some(value) => value,
+                None => return Ok(()),
+            }
+        } else {
+            self.interaction.password("Value")?
+        };
         let credential = Credential::new(key, name, value);
 
         if vault.find_credential(credential.key()).is_some() {
@@ -320,6 +374,85 @@ impl<I: Interaction> App<I> {
 
         vault.upsert_credential(credential);
         Self::persist(path, vault)
+    }
+
+    /// Collects Generated value options and lets the user review each generated value.
+    fn generated_value(&mut self) -> Result<Option<String>, AppError> {
+        let options = self.generated_value_options()?;
+        let mut previous = None;
+
+        loop {
+            let value = generator::generate(options)?;
+            if previous.as_deref() == Some(value.as_str()) {
+                continue;
+            }
+            self.interaction
+                .message(&format!("Generated value: {value}"))?;
+            previous = Some(value.clone());
+
+            let choice = self
+                .interaction
+                .choose("Generated value", &["Confirm", "Regenerate", "Cancel"])?;
+            match choice {
+                0 => return Ok(Some(value)),
+                1 => {}
+                2 => return Ok(None),
+                choice => {
+                    return Err(AppError::InvalidChoice {
+                        prompt: "Generated value",
+                        choice,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Prompts for a valid Generated value length and its optional character classes.
+    fn generated_value_options(&mut self) -> Result<GeneratedValueOptions, AppError> {
+        let default_length = DEFAULT_LENGTH.to_string();
+        let length = loop {
+            let entered = self
+                .interaction
+                .input_with_default("Generated value length (10-100)", &default_length)?;
+            let trimmed = entered.trim();
+            let length = if trimmed.is_empty() {
+                DEFAULT_LENGTH
+            } else {
+                match trimmed.parse::<usize>() {
+                    Ok(length) => length,
+                    Err(_) => {
+                        self.interaction.message(
+                            "Generated value length must be an integer from 10 through 100.",
+                        )?;
+                        continue;
+                    }
+                }
+            };
+
+            if let Err(error) = GeneratedValueOptions::new(length, true, true) {
+                self.interaction.message(&error.to_string())?;
+            } else {
+                break length;
+            }
+        };
+
+        let include_digits = self.choose_generated_option("Include digits")?;
+        let include_punctuation = self.choose_generated_option("Include punctuation")?;
+        Ok(GeneratedValueOptions::new(
+            length,
+            include_digits,
+            include_punctuation,
+        )?)
+    }
+
+    /// Asks whether one optional Generated value character class should be enabled.
+    fn choose_generated_option(&mut self, prompt: &'static str) -> Result<bool, AppError> {
+        let choice = self.interaction.choose(prompt, &["Yes", "No"])?;
+        match choice {
+            0 => Ok(true),
+            1 => Ok(false),
+            choice => Err(AppError::InvalidChoice { prompt, choice }),
+        }
     }
 
     /// Looks up and displays one Credential, offering explicit fuzzy matches when needed.
