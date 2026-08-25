@@ -238,8 +238,15 @@ impl TuiInteraction {
                 self.move_under(page, &[TuiPage::VaultHome]);
             }
             TuiPage::Key => self.move_under(page, &[TuiPage::Add, TuiPage::Get, TuiPage::Remove]),
-            TuiPage::Name | TuiPage::Value | TuiPage::Review => {
-                self.move_under(page, &[TuiPage::Add]);
+            TuiPage::Name => self.move_under(page, &[TuiPage::Key, TuiPage::Add]),
+            TuiPage::Value => {
+                self.move_under(page, &[TuiPage::Name, TuiPage::Key, TuiPage::Add]);
+            }
+            TuiPage::Review => {
+                self.move_under(
+                    page,
+                    &[TuiPage::Value, TuiPage::Name, TuiPage::Key, TuiPage::Add],
+                );
             }
             TuiPage::GeneratorSettings => self.move_under(page, &[TuiPage::Value]),
             TuiPage::GeneratedValue => self.move_under(page, &[TuiPage::GeneratorSettings]),
