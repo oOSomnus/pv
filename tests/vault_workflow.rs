@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 use bincode::{Encode, config, encode_to_vec};
 use pv::{
     app::{App, Interaction, InteractionError},
-    vault::Vault,
+    vault::{Credential, Vault},
 };
 use tempfile::tempdir;
 
@@ -24,10 +24,16 @@ struct UnsupportedEnvelope {
 struct ScriptedInteraction {
     /// Passwords returned in prompt order.
     passwords: VecDeque<String>,
+    /// Text inputs returned in prompt order.
+    inputs: VecDeque<String>,
     /// Menu selections returned in prompt order.
     choices: VecDeque<usize>,
     /// Messages emitted by the workflow.
     messages: Rc<RefCell<Vec<String>>>,
+    /// Prompts that requested hidden password input.
+    password_prompts: Rc<RefCell<Vec<String>>>,
+    /// Prompts that requested visible text input.
+    input_prompts: Rc<RefCell<Vec<String>>>,
 }
 
 impl ScriptedInteraction {
@@ -35,9 +41,18 @@ impl ScriptedInteraction {
     fn with_passwords(passwords: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             passwords: passwords.into_iter().map(Into::into).collect(),
+            inputs: VecDeque::new(),
             choices: VecDeque::new(),
             messages: Rc::new(RefCell::new(Vec::new())),
+            password_prompts: Rc::new(RefCell::new(Vec::new())),
+            input_prompts: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    /// Adds a scripted sequence of visible text inputs to this adapter.
+    fn with_inputs(mut self, inputs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Adds a scripted sequence of menu selections to this adapter.
@@ -50,14 +65,33 @@ impl ScriptedInteraction {
     fn message_log(&self) -> Rc<RefCell<Vec<String>>> {
         Rc::clone(&self.messages)
     }
+
+    /// Returns a shared view of prompts that requested hidden input.
+    fn password_prompt_log(&self) -> Rc<RefCell<Vec<String>>> {
+        Rc::clone(&self.password_prompts)
+    }
+
+    /// Returns a shared view of prompts that requested visible input.
+    fn input_prompt_log(&self) -> Rc<RefCell<Vec<String>>> {
+        Rc::clone(&self.input_prompts)
+    }
 }
 
 impl Interaction for ScriptedInteraction {
     /// Returns the next scripted password response.
-    fn password(&mut self, _prompt: &str) -> Result<String, InteractionError> {
+    fn password(&mut self, prompt: &str) -> Result<String, InteractionError> {
+        self.password_prompts.borrow_mut().push(prompt.to_owned());
         self.passwords
             .pop_front()
             .ok_or_else(|| InteractionError::new("no scripted password available"))
+    }
+
+    /// Returns the next scripted visible text response.
+    fn input(&mut self, prompt: &str) -> Result<String, InteractionError> {
+        self.input_prompts.borrow_mut().push(prompt.to_owned());
+        self.inputs
+            .pop_front()
+            .ok_or_else(|| InteractionError::new("no scripted input available"))
     }
 
     /// Returns the next scripted menu selection.
@@ -102,7 +136,7 @@ fn init_then_open_completes_the_empty_vault_lifecycle() {
     let path = directory.path().join("lifecycle.vault");
     let password = "lifecycle password";
     let mut app = App::new(
-        ScriptedInteraction::with_passwords([password, password, password]).with_choices([0]),
+        ScriptedInteraction::with_passwords([password, password, password]).with_choices([2]),
     );
 
     app.init(&path).expect("initialization should succeed");
@@ -197,7 +231,7 @@ fn open_unlocks_a_vault_and_exits_the_empty_vault_menu_without_mutation() {
         .to_bytes()
         .expect("vault should be encoded");
     std::fs::write(&path, &bytes).expect("vault should be written");
-    let mut app = App::new(ScriptedInteraction::with_passwords([password]).with_choices([0]));
+    let mut app = App::new(ScriptedInteraction::with_passwords([password]).with_choices([2]));
 
     let result = app.open(&path).expect("opening should succeed");
 
@@ -220,7 +254,7 @@ fn open_reports_an_incorrect_password_and_allows_a_retry() {
         .expect("vault should be encoded");
     std::fs::write(&path, &bytes).expect("vault should be written");
     let interaction =
-        ScriptedInteraction::with_passwords(["wrong password", password]).with_choices([0, 0]);
+        ScriptedInteraction::with_passwords(["wrong password", password]).with_choices([0, 2]);
     let messages = interaction.message_log();
     let mut app = App::new(interaction);
 
@@ -346,4 +380,189 @@ fn open_reports_an_unreadable_vault_path_without_replacing_it() {
 
     assert!(error.to_string().contains("could not read vault"));
     assert!(path.is_dir());
+}
+
+/// Verifies that a manually entered Credential remains available after reopening.
+#[test]
+fn manual_add_is_persisted_and_retrievable_after_reopening() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("manual-add.vault");
+    let master_password = "manual add master password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let add_interaction = ScriptedInteraction::with_passwords([master_password, "secret value"])
+        .with_inputs(["  YouTube  ", "alice"])
+        .with_choices([0, 2]);
+    let password_prompts = add_interaction.password_prompt_log();
+    let input_prompts = add_interaction.input_prompt_log();
+    let mut add_app = App::new(add_interaction);
+
+    add_app
+        .open(&path)
+        .expect("adding a Credential should succeed");
+    let bytes_after_add = std::fs::read(&path).expect("vault should be readable");
+    assert!(
+        !bytes_after_add
+            .windows("secret value".len())
+            .any(|candidate| candidate == b"secret value")
+    );
+
+    assert_eq!(
+        password_prompts.borrow().as_slice(),
+        ["Master password", "Value"]
+    );
+    assert_eq!(input_prompts.borrow().as_slice(), ["Key", "Name"]);
+
+    let get_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube"])
+        .with_choices([1, 2]);
+    let messages = get_interaction.message_log();
+    let mut get_app = App::new(get_interaction);
+
+    get_app
+        .open(&path)
+        .expect("the Credential should survive reopening");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Key:   YouTube  \nName: alice\nValue: secret value"]
+    );
+}
+
+/// Verifies that a duplicate normalized Key overwrites its Name and Value in place.
+#[test]
+fn duplicate_normalized_key_overwrites_name_and_value() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("duplicate-overwrite.vault");
+    let master_password = "duplicate master password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let add_interaction =
+        ScriptedInteraction::with_passwords([master_password, "first secret", "second secret"])
+            .with_inputs([
+                "  YouTube  ",
+                "first name",
+                "youtube",
+                "second name",
+                "YOUTUBE",
+            ])
+            .with_choices([0, 0, 0, 2]);
+    let duplicate_messages = add_interaction.message_log();
+    let mut add_app = App::new(add_interaction);
+
+    add_app
+        .open(&path)
+        .expect("the duplicate should be explicitly overwritten");
+
+    assert_eq!(
+        duplicate_messages.borrow().as_slice(),
+        ["A Credential entry with that Key already exists."]
+    );
+
+    let get_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["YOUTUBE"])
+        .with_choices([1, 2]);
+    let messages = get_interaction.message_log();
+    let mut get_app = App::new(get_interaction);
+
+    get_app
+        .open(&path)
+        .expect("the overwritten Credential should survive reopening");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Key:   YouTube  \nName: second name\nValue: second secret"]
+    );
+}
+
+/// Verifies that cancelling a duplicate Add leaves both memory and disk unchanged.
+#[test]
+fn duplicate_add_can_be_cancelled_without_mutating_the_vault() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("duplicate-cancel.vault");
+    let master_password = "duplicate cancellation password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+
+    let mut add_app = App::new(
+        ScriptedInteraction::with_passwords([master_password, "original secret"])
+            .with_inputs(["YouTube", "original name"])
+            .with_choices([0, 2]),
+    );
+    add_app
+        .open(&path)
+        .expect("the original Credential should be added");
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let mut cancel_app = App::new(
+        ScriptedInteraction::with_passwords([master_password, "discarded secret"])
+            .with_inputs([" youtube ", "discarded name"])
+            .with_choices([0, 1, 2]),
+    );
+
+    cancel_app
+        .open(&path)
+        .expect("cancelling the duplicate should return to the menu");
+
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that a cancelled missing-key Get leaves the persisted Vault unchanged.
+#[test]
+fn get_can_be_cancelled_without_mutating_the_vault() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("get-cancel.vault");
+    let master_password = "get cancellation password";
+    let mut init_app = App::new(ScriptedInteraction::with_passwords([
+        master_password,
+        master_password,
+    ]));
+
+    init_app.init(&path).expect("initialization should succeed");
+    let bytes_before_get = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["missing key"])
+        .with_choices([1, 1, 2]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("cancelling a missing-key Get should return to the menu");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Credential entry not found."]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_get
+    );
+}
+
+/// Verifies that Debug output redacts a Credential Value.
+#[test]
+fn credential_debug_output_does_not_expose_the_value() {
+    let credential = Credential::new("youtube", "alice", "secret value");
+    let debug = format!("{credential:?}");
+
+    assert!(!debug.contains("secret value"));
+    assert!(debug.contains("[REDACTED]"));
 }
