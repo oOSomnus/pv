@@ -322,21 +322,42 @@ impl<I: Interaction> App<I> {
         Self::persist(path, vault)
     }
 
-    /// Looks up and displays one Credential without mutating the Vault.
+    /// Looks up and displays one Credential, offering explicit fuzzy matches when needed.
     fn get_credential(&mut self, vault: &Vault) -> Result<(), AppError> {
         loop {
             let query = self.interaction.input("Key")?;
             if let Some(credential) = vault.find_credential(&query) {
-                self.interaction.message(&format!(
-                    "Key: {}\nName: {}\nValue: {}",
-                    credential.key(),
-                    credential.name(),
-                    credential.value()
-                ))?;
+                self.display_credential(credential)?;
                 return Ok(());
             }
 
             self.interaction.message("Credential entry not found.")?;
+            let suggestions = vault.find_credential_suggestions(&query);
+            if !suggestions.is_empty() {
+                let mut options: Vec<String> = suggestions
+                    .iter()
+                    .map(|credential| credential.key().to_owned())
+                    .collect();
+                options.push("Cancel".to_owned());
+                let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
+                let choice = self
+                    .interaction
+                    .choose("Credential suggestions", &option_references)?;
+                match choice {
+                    choice if choice < suggestions.len() => {
+                        self.display_credential(suggestions[choice])?;
+                        return Ok(());
+                    }
+                    choice if choice == suggestions.len() => return Ok(()),
+                    choice => {
+                        return Err(AppError::InvalidChoice {
+                            prompt: "Credential suggestions",
+                            choice,
+                        });
+                    }
+                }
+            }
+
             let choice = self
                 .interaction
                 .choose("Credential not found", &["Retry", "Cancel"])?;
@@ -351,6 +372,17 @@ impl<I: Interaction> App<I> {
                 }
             }
         }
+    }
+
+    /// Displays a Credential's Key, Name, and Value through the interaction adapter.
+    fn display_credential(&mut self, credential: &Credential) -> Result<(), AppError> {
+        self.interaction.message(&format!(
+            "Key: {}\nName: {}\nValue: {}",
+            credential.key(),
+            credential.name(),
+            credential.value()
+        ))?;
+        Ok(())
     }
 
     /// Encrypts and synchronizes the current Vault at its existing path.

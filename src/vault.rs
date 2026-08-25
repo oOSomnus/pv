@@ -18,6 +18,8 @@ const NONCE_LENGTH: usize = 12;
 const KEY_LENGTH: usize = 32;
 /// The number of bytes in an AES-GCM authentication tag.
 const AUTH_TAG_LENGTH: usize = 16;
+/// The maximum number of fuzzy Credential suggestions returned for a query.
+const MAX_FUZZY_SUGGESTIONS: usize = 3;
 
 /// The versioned serialized container stored on disk.
 #[derive(Debug, Encode, Decode)]
@@ -219,6 +221,45 @@ impl Vault {
             .find(|credential| normalize_key(credential.key()) == normalized_query)
     }
 
+    /// Returns up to three useful fuzzy Credential matches ordered by Key similarity.
+    ///
+    /// Similarity is measured with character-based Levenshtein distance. Candidates
+    /// retaining less than 40% similarity to the normalized query are omitted, and
+    /// ties are ordered by normalized Key and then insertion order.
+    pub fn find_credential_suggestions(&self, query: &str) -> Vec<&Credential> {
+        let normalized_query = normalize_key(query);
+        let query_length = normalized_query.chars().count();
+        let mut candidates: Vec<(usize, String, usize)> = self
+            .payload
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, credential)| {
+                let normalized_key = normalize_key(credential.key());
+                let key_length = normalized_key.chars().count();
+                let distance = levenshtein_distance(&normalized_query, &normalized_key);
+                is_useful_fuzzy_match(distance, query_length, key_length).then_some((
+                    distance,
+                    normalized_key,
+                    index,
+                ))
+            })
+            .collect();
+
+        candidates.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+
+        candidates
+            .into_iter()
+            .take(MAX_FUZZY_SUGGESTIONS)
+            .map(|(_, _, index)| &self.payload.entries[index])
+            .collect()
+    }
+
     /// Inserts a Credential or replaces the Name and Value of the entry with the same normalized Key.
     ///
     /// Returns `true` when an existing entry was replaced and `false` when a new
@@ -243,6 +284,34 @@ impl Vault {
 /// Normalizes a Key for exact matching without changing its stored spelling.
 fn normalize_key(key: &str) -> String {
     key.trim().to_lowercase()
+}
+
+/// Returns whether an edit distance retains enough normalized similarity to help.
+fn is_useful_fuzzy_match(distance: usize, query_length: usize, key_length: usize) -> bool {
+    let longest_length = query_length.max(key_length);
+    longest_length > 0 && distance <= longest_length.saturating_mul(3) / 5
+}
+
+/// Computes the Levenshtein edit distance between two UTF-8 strings by character.
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut distances: Vec<usize> = (0..=right_chars.len()).collect();
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut diagonal = distances[0];
+        distances[0] = left_index + 1;
+
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let previous_row = distances[right_index + 1];
+            let substitution = diagonal + usize::from(left_char != *right_char);
+            distances[right_index + 1] = (distances[right_index + 1] + 1)
+                .min(distances[right_index] + 1)
+                .min(substitution);
+            diagonal = previous_row;
+        }
+    }
+
+    distances[right_chars.len()]
 }
 
 /// Decodes one complete Vault envelope and rejects trailing bytes.
