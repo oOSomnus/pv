@@ -5,6 +5,7 @@ use aes_gcm::{
 use argon2::{Algorithm, Argon2, Params, Version};
 use bincode::{Decode, Encode, config, decode_from_slice, encode_to_vec};
 use rand::{TryRng, rngs::SysRng};
+use std::fmt;
 use thiserror::Error;
 
 /// The version number of the currently supported serialized Vault envelope.
@@ -31,11 +32,60 @@ struct Envelope {
     cipher_text: Vec<u8>,
 }
 
-/// The plaintext payload represented by the current empty Vault format.
+/// A Credential entry stored inside a Vault.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+pub struct Credential {
+    /// The website or service identifier used to locate this entry.
+    key: String,
+    /// The username or login identity associated with the Key.
+    name: String,
+    /// The password or other secret associated with the Key and Name.
+    value: String,
+}
+
+impl fmt::Debug for Credential {
+    /// Formats a Credential without exposing its secret Value.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Credential")
+            .field("key", &self.key)
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Credential {
+    /// Creates a Credential from its entered Key, Name, and Value.
+    pub fn new(key: impl Into<String>, name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Returns the entered Key spelling preserved for display.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the login Name stored with the Credential.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the secret Value stored with the Credential.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// The plaintext payload represented by a Vault's Credential entries.
 #[derive(Debug, Encode, Decode)]
 struct Payload {
-    /// Opaque payload bytes reserved for credential entries in later workflows.
-    bytes: Vec<u8>,
+    /// Credential entries retained in insertion order and matched by normalized Keys.
+    entries: Vec<Credential>,
 }
 
 /// An unlocked Vault held in memory with its derived encryption key.
@@ -105,7 +155,9 @@ impl Vault {
         Ok(Self {
             salt,
             key,
-            payload: Payload { bytes: Vec::new() },
+            payload: Payload {
+                entries: Vec::new(),
+            },
         })
     }
 
@@ -157,6 +209,40 @@ impl Vault {
         };
         encode_to_vec(&envelope, config::standard()).map_err(VaultError::Encode)
     }
+
+    /// Finds the first Credential whose normalized Key matches `query`.
+    pub fn find_credential(&self, query: &str) -> Option<&Credential> {
+        let normalized_query = normalize_key(query);
+        self.payload
+            .entries
+            .iter()
+            .find(|credential| normalize_key(credential.key()) == normalized_query)
+    }
+
+    /// Inserts a Credential or replaces the Name and Value of the entry with the same normalized Key.
+    ///
+    /// Returns `true` when an existing entry was replaced and `false` when a new
+    /// entry was appended.
+    pub fn upsert_credential(&mut self, credential: Credential) -> bool {
+        if let Some(existing) = self
+            .payload
+            .entries
+            .iter_mut()
+            .find(|existing| normalize_key(existing.key()) == normalize_key(credential.key()))
+        {
+            existing.name = credential.name;
+            existing.value = credential.value;
+            true
+        } else {
+            self.payload.entries.push(credential);
+            false
+        }
+    }
+}
+
+/// Normalizes a Key for exact matching without changing its stored spelling.
+fn normalize_key(key: &str) -> String {
+    key.trim().to_lowercase()
 }
 
 /// Decodes one complete Vault envelope and rejects trailing bytes.

@@ -7,10 +7,10 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use dialoguer::{Password, Select};
+use dialoguer::{Input, Password, Select};
 use thiserror::Error;
 
-use crate::vault::{Vault, VaultError};
+use crate::vault::{Credential, Vault, VaultError};
 
 /// The Vault path used by the command line when the caller omits a path.
 pub const DEFAULT_VAULT_PATH: &str = "./pv.vault";
@@ -19,6 +19,13 @@ pub const DEFAULT_VAULT_PATH: &str = "./pv.vault";
 pub trait Interaction {
     /// Reads a hidden password from the user.
     fn password(&mut self, prompt: &str) -> Result<String, InteractionError>;
+
+    /// Reads visible text from the user, or returns an error when unsupported.
+    fn input(&mut self, prompt: &str) -> Result<String, InteractionError> {
+        Err(InteractionError::new(format!(
+            "visible input is unavailable for prompt {prompt}"
+        )))
+    }
 
     /// Presents a menu and returns the selected option index.
     fn choose(&mut self, prompt: &str, options: &[&str]) -> Result<usize, InteractionError>;
@@ -44,6 +51,14 @@ impl Interaction for DialoguerInteraction {
         Password::new()
             .with_prompt(prompt)
             .interact()
+            .map_err(|error| InteractionError::new(error.to_string()))
+    }
+
+    /// Reads visible text using dialoguer's text prompt.
+    fn input(&mut self, prompt: &str) -> Result<String, InteractionError> {
+        Input::<String>::new()
+            .with_prompt(prompt)
+            .interact_text()
             .map_err(|error| InteractionError::new(error.to_string()))
     }
 
@@ -157,7 +172,7 @@ pub struct App<I> {
 /// Describes how an open Vault session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenResult {
-    /// The user selected Exit from the empty Vault menu.
+    /// The user selected Exit from the open Vault menu.
     Exited,
     /// The user cancelled after an incorrect password.
     Cancelled,
@@ -225,7 +240,7 @@ impl<I: Interaction> App<I> {
         Ok(())
     }
 
-    /// Opens `path`, unlocks it, and runs the empty Vault menu until it exits or cancels.
+    /// Opens `path`, unlocks it, and runs the Vault menu until it exits or cancels.
     pub fn open(&mut self, path: &Path) -> Result<OpenResult, AppError> {
         let bytes = fs::read(path).map_err(|source| AppError::ReadVault {
             path: path.to_owned(),
@@ -235,15 +250,8 @@ impl<I: Interaction> App<I> {
         loop {
             let password = self.interaction.password("Master password")?;
             match Vault::unlock(&bytes, &password) {
-                Ok(_vault) => {
-                    let choice = self.interaction.choose("Vault", &["Exit"])?;
-                    return match choice {
-                        0 => Ok(OpenResult::Exited),
-                        choice => Err(AppError::InvalidChoice {
-                            prompt: "Vault",
-                            choice,
-                        }),
-                    };
+                Ok(mut vault) => {
+                    return self.run_open_session(path, &mut vault);
                 }
                 Err(VaultError::InvalidMasterPassword) => {
                     self.interaction
@@ -265,6 +273,102 @@ impl<I: Interaction> App<I> {
                 Err(error) => return Err(AppError::Vault(error)),
             }
         }
+    }
+
+    /// Runs the credential menu for an already unlocked Vault.
+    fn run_open_session(&mut self, path: &Path, vault: &mut Vault) -> Result<OpenResult, AppError> {
+        loop {
+            let choice = self.interaction.choose("Vault", &["Add", "Get", "Exit"])?;
+            match choice {
+                0 => self.add_credential(path, vault)?,
+                1 => self.get_credential(vault)?,
+                2 => return Ok(OpenResult::Exited),
+                choice => {
+                    return Err(AppError::InvalidChoice {
+                        prompt: "Vault",
+                        choice,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Collects one manual Credential and persists it after duplicate handling.
+    fn add_credential(&mut self, path: &Path, vault: &mut Vault) -> Result<(), AppError> {
+        let key = self.interaction.input("Key")?;
+        let name = self.interaction.input("Name")?;
+        let value = self.interaction.password("Value")?;
+        let credential = Credential::new(key, name, value);
+
+        if vault.find_credential(credential.key()).is_some() {
+            self.interaction
+                .message("A Credential entry with that Key already exists.")?;
+            let choice = self
+                .interaction
+                .choose("Duplicate Key", &["Overwrite", "Cancel"])?;
+            match choice {
+                0 => {}
+                1 => return Ok(()),
+                choice => {
+                    return Err(AppError::InvalidChoice {
+                        prompt: "Duplicate Key",
+                        choice,
+                    });
+                }
+            }
+        }
+
+        vault.upsert_credential(credential);
+        Self::persist(path, vault)
+    }
+
+    /// Looks up and displays one Credential without mutating the Vault.
+    fn get_credential(&mut self, vault: &Vault) -> Result<(), AppError> {
+        loop {
+            let query = self.interaction.input("Key")?;
+            if let Some(credential) = vault.find_credential(&query) {
+                self.interaction.message(&format!(
+                    "Key: {}\nName: {}\nValue: {}",
+                    credential.key(),
+                    credential.name(),
+                    credential.value()
+                ))?;
+                return Ok(());
+            }
+
+            self.interaction.message("Credential entry not found.")?;
+            let choice = self
+                .interaction
+                .choose("Credential not found", &["Retry", "Cancel"])?;
+            match choice {
+                0 => {}
+                1 => return Ok(()),
+                choice => {
+                    return Err(AppError::InvalidChoice {
+                        prompt: "Credential not found",
+                        choice,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Encrypts and synchronizes the current Vault at its existing path.
+    fn persist(path: &Path, vault: &Vault) -> Result<(), AppError> {
+        let bytes = vault.to_bytes()?;
+        let mut options = OpenOptions::new();
+        options.write(true).truncate(true);
+        let mut file = options.open(path).map_err(|source| AppError::WriteVault {
+            path: path.to_owned(),
+            source,
+        })?;
+
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|source| AppError::WriteVault {
+                path: path.to_owned(),
+                source,
+            })
     }
 
     /// Re-prompts until the interaction adapter returns a non-empty password.
