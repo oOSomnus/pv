@@ -24,9 +24,9 @@ struct UnsupportedEnvelope {
 struct ScriptedInteraction {
     /// Passwords returned in prompt order.
     passwords: VecDeque<InteractionResult<String>>,
-    /// Text inputs returned in prompt order.
+    /// Text inputs or navigation actions returned in prompt order.
     inputs: VecDeque<InteractionResult<String>>,
-    /// Menu selections returned in prompt order.
+    /// Menu selections or navigation actions returned in prompt order.
     choices: VecDeque<InteractionResult<usize>>,
     /// Messages emitted by the workflow.
     messages: Rc<RefCell<Vec<String>>>,
@@ -88,7 +88,7 @@ impl ScriptedInteraction {
         self
     }
 
-    /// Adds menu results that may include renderer-neutral navigation actions.
+    /// Adds menu selections and navigation results to this adapter.
     fn with_choice_results(
         mut self,
         choices: impl IntoIterator<Item = InteractionResult<usize>>,
@@ -1137,7 +1137,14 @@ fn remove_exact_key_is_confirmed_persisted_and_absent_after_reopen() {
     app.open(&path)
         .expect("confirmed exact removal should succeed");
 
-    assert_eq!(messages.borrow().as_slice(), ["Key: YouTube\nName: alice"]);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Key: YouTube\nName: alice",
+            "Key: YouTube\nName: alice",
+            "Credential entry removed: YouTube",
+        ]
+    );
     assert!(
         !messages
             .borrow()
@@ -1192,7 +1199,12 @@ fn remove_can_select_a_fuzzy_candidate_before_confirming() {
     );
     assert_eq!(
         messages.borrow().as_slice(),
-        ["Credential entry not found.", "Key: youtube\nName: alice"]
+        [
+            "Credential entry not found.",
+            "Key: youtube\nName: alice",
+            "Key: youtube\nName: alice",
+            "Credential entry removed: youtube",
+        ]
     );
     assert!(
         !messages
@@ -1274,6 +1286,197 @@ fn remove_without_candidates_can_be_cancelled_without_mutation() {
     );
 }
 
+/// Verifies that Back from the Remove Key lookup returns to Vault home unchanged.
+#[test]
+fn remove_lookup_back_returns_to_vault_home_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-lookup-back.vault");
+    let master_password = "remove lookup back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_back = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([InteractionResult::Back])
+        .with_choice_results([InteractionResult::Value(2), InteractionResult::Value(3)]);
+    let messages = interaction.message_log();
+    let input_prompts = interaction.input_prompt_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Back from Remove lookup should return to home");
+
+    assert_eq!(input_prompts.borrow().as_slice(), ["Key"]);
+    assert!(messages.borrow().is_empty());
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_back
+    );
+}
+
+/// Verifies that Cancel from the Remove Key lookup returns to Vault home unchanged.
+#[test]
+fn remove_lookup_cancel_returns_to_vault_home_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-lookup-cancel.vault");
+    let master_password = "remove lookup cancel password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([InteractionResult::Cancel])
+        .with_choice_results([InteractionResult::Value(2), InteractionResult::Value(3)]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Cancel from Remove lookup should return to home");
+
+    assert!(messages.borrow().is_empty());
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that Back from fuzzy candidate selection returns to Key lookup unchanged.
+#[test]
+fn remove_candidate_selection_back_returns_to_lookup_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-candidates-back.vault");
+    let master_password = "remove candidates back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_back = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([
+            InteractionResult::Value("youtub".to_owned()),
+            InteractionResult::Cancel,
+        ])
+        .with_choice_results([
+            InteractionResult::Value(2),
+            InteractionResult::Back,
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let input_prompts = interaction.input_prompt_log();
+    let choice_options = interaction.choice_options_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Back from candidates should return to Key lookup");
+
+    assert_eq!(input_prompts.borrow().as_slice(), ["Key", "Key"]);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Credential entry not found."]
+    );
+    assert_eq!(choice_options.borrow().len(), 3);
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_back
+    );
+}
+
+/// Verifies that Cancel from fuzzy candidate selection returns home unchanged.
+#[test]
+fn remove_candidate_selection_cancel_returns_to_vault_home_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-candidates-cancel.vault");
+    let master_password = "remove candidates cancel password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([InteractionResult::Value("youtub".to_owned())])
+        .with_choice_results([
+            InteractionResult::Value(2),
+            InteractionResult::Cancel,
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Cancel from candidates should return to home");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Credential entry not found."]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that Back from fuzzy removal confirmation restores candidate selection unchanged.
+#[test]
+fn remove_fuzzy_confirmation_back_returns_to_candidates_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory
+        .path()
+        .join("remove-fuzzy-confirmation-back.vault");
+    let master_password = "remove fuzzy confirmation back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [
+            Credential::new("youtube", "alice", "secret value"),
+            Credential::new("youtube-help", "support", "help value"),
+        ],
+    );
+    let bytes_before_back = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([InteractionResult::Value("youtub".to_owned())])
+        .with_choice_results([
+            InteractionResult::Value(2),
+            InteractionResult::Value(0),
+            InteractionResult::Back,
+            InteractionResult::Cancel,
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let choice_options = interaction.choice_options_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Back from fuzzy confirmation should restore candidates");
+
+    assert_eq!(
+        choice_options.borrow()[3],
+        [
+            "youtube".to_owned(),
+            "youtube-help".to_owned(),
+            "Cancel".to_owned(),
+        ]
+    );
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Credential entry not found.", "Key: youtube\nName: alice",]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_back
+    );
+}
+
 /// Verifies that rejecting the first removal confirmation leaves the Vault unchanged.
 #[test]
 fn remove_first_confirmation_can_be_rejected_without_mutation() {
@@ -1306,6 +1509,81 @@ fn remove_first_confirmation_can_be_rejected_without_mutation() {
     );
 }
 
+/// Verifies that Back from the first confirmation returns to Key lookup unchanged.
+#[test]
+fn remove_first_confirmation_back_returns_to_lookup_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory
+        .path()
+        .join("remove-first-confirmation-back.vault");
+    let master_password = "remove first confirmation back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_back = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([
+            InteractionResult::Value("youtube".to_owned()),
+            InteractionResult::Cancel,
+        ])
+        .with_choice_results([
+            InteractionResult::Value(2),
+            InteractionResult::Back,
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let input_prompts = interaction.input_prompt_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Back from the first confirmation should return to lookup");
+
+    assert_eq!(input_prompts.borrow().as_slice(), ["Key", "Key"]);
+    assert_eq!(messages.borrow().as_slice(), ["Key: youtube\nName: alice"]);
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_back
+    );
+}
+
+/// Verifies that Cancel from the first confirmation returns home unchanged.
+#[test]
+fn remove_first_confirmation_cancel_returns_to_vault_home_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory
+        .path()
+        .join("remove-first-confirmation-cancel.vault");
+    let master_password = "remove first confirmation cancel password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([InteractionResult::Value("youtube".to_owned())])
+        .with_choice_results([
+            InteractionResult::Value(2),
+            InteractionResult::Cancel,
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Cancel from the first confirmation should return home");
+
+    assert_eq!(messages.borrow().as_slice(), ["Key: youtube\nName: alice"]);
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
 /// Verifies that rejecting the second removal confirmation leaves the Vault unchanged.
 #[test]
 fn remove_second_confirmation_can_be_rejected_without_mutation() {
@@ -1329,9 +1607,142 @@ fn remove_second_confirmation_can_be_rejected_without_mutation() {
     app.open(&path)
         .expect("rejecting the second removal confirmation should be safe");
 
-    assert_eq!(messages.borrow().as_slice(), ["Key: youtube\nName: alice"]);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Key: youtube\nName: alice", "Key: youtube\nName: alice"]
+    );
     assert_eq!(choice_options.borrow()[1], ["Confirm", "Cancel"]);
     assert_eq!(choice_options.borrow()[2], ["Delete", "Cancel"]);
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that Back from the second confirmation returns to the first unchanged.
+#[test]
+fn remove_second_confirmation_back_returns_to_first_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory
+        .path()
+        .join("remove-second-confirmation-back.vault");
+    let master_password = "remove second confirmation back password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_back = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([InteractionResult::Value("youtube".to_owned())])
+        .with_choice_results([
+            InteractionResult::Value(2),
+            InteractionResult::Value(0),
+            InteractionResult::Back,
+            InteractionResult::Cancel,
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let choice_options = interaction.choice_options_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Back from the second confirmation should return to the first");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Key: youtube\nName: alice",
+            "Key: youtube\nName: alice",
+            "Key: youtube\nName: alice",
+        ]
+    );
+    assert_eq!(choice_options.borrow().len(), 5);
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_back
+    );
+}
+
+/// Verifies that Cancel from the second confirmation returns home unchanged.
+#[test]
+fn remove_second_confirmation_cancel_returns_to_vault_home_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory
+        .path()
+        .join("remove-second-confirmation-cancel.vault");
+    let master_password = "remove second confirmation cancel password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([InteractionResult::Value("youtube".to_owned())])
+        .with_choice_results([
+            InteractionResult::Value(2),
+            InteractionResult::Value(0),
+            InteractionResult::Cancel,
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("Cancel from the second confirmation should return home");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Key: youtube\nName: alice", "Key: youtube\nName: alice"]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that a cancelled removal leaves the unlocked in-memory Vault unchanged.
+#[test]
+fn remove_cancel_preserves_the_in_memory_vault() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-in-memory-cancel.vault");
+    let master_password = "remove in-memory cancel password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_input_results([
+            InteractionResult::Value("youtube".to_owned()),
+            InteractionResult::Value("youtube".to_owned()),
+        ])
+        .with_choice_results([
+            InteractionResult::Value(2),
+            InteractionResult::Value(0),
+            InteractionResult::Cancel,
+            InteractionResult::Value(1),
+            InteractionResult::Value(3),
+        ]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("a cancelled removal should leave the session usable");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        [
+            "Key: youtube\nName: alice",
+            "Key: youtube\nName: alice",
+            "Key: youtube\nName: alice\nValue: secret value",
+        ]
+    );
     assert_eq!(
         std::fs::read(&path).expect("vault should remain readable"),
         bytes_before_cancel
