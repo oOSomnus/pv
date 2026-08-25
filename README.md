@@ -8,7 +8,7 @@ PV is a local command-line password manager for storing website credentials in a
 - Use `./pv.vault` when no path is supplied.
 - Store each credential as a `Key` (website or service), `Name` (username), and hidden `Value` (password or secret).
 - Add values manually or generate secure values from 8 to 100 characters, with a default length of 20, Numbers enabled by default, and Symbols disabled by default.
-- Generated values always contain ASCII letters; optional Numbers and the exact Symbols `!@.-_*` are guaranteed when enabled, and candidates remain masked until saved. The Value step offers the Random path directly.
+- Generated values always contain ASCII letters; optional Numbers and the exact Symbols `!@.-_*` are guaranteed when enabled, and candidates are shown before the user confirms them. The Value step offers the Random path directly.
 - Find credentials by case-insensitive, whitespace-trimmed Key matching, with up to three fuzzy suggestions for typos.
 - Remove credentials only after two independent confirmations.
 - Persist every successful mutation immediately.
