@@ -1,10 +1,13 @@
 //! Command-line entry point for the PV encrypted Vault manager.
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand};
 use pv::{
-    app::{App, DEFAULT_VAULT_PATH},
+    app::{App, DEFAULT_VAULT_PATH, Interaction, InteractionResult},
     tui::{TuiInteraction, TuiWorkflow},
 };
 
@@ -39,29 +42,51 @@ fn main() -> ExitCode {
         Commands::Init { .. } => TuiWorkflow::Init,
         Commands::Open { .. } => TuiWorkflow::Open,
     };
-    let interaction = match TuiInteraction::new(workflow) {
-        Ok(interaction) => interaction,
-        Err(error) => {
-            eprintln!("Error: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    loop {
+        let interaction = match TuiInteraction::new(workflow) {
+            Ok(interaction) => interaction,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
 
-    let result = {
-        let mut app = App::new(interaction);
-        match cli.command {
-            Commands::Init { path } => app.init(&path.unwrap_or_else(default_vault_path)),
-            Commands::Open { path } => app
-                .open(&path.unwrap_or_else(default_vault_path))
-                .map(|_| ()),
-        }
-    };
+        let (result, mut interaction) = {
+            let mut app = App::new(interaction);
+            let result = match &cli.command {
+                Commands::Init { path } => {
+                    let path = path
+                        .as_deref()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(default_vault_path);
+                    app.init(&path)
+                }
+                Commands::Open { path } => {
+                    let path = path
+                        .as_deref()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(default_vault_path);
+                    app.open(&path).map(|_| ())
+                }
+            };
+            (result, app.into_interaction())
+        };
 
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("Error: {error}");
-            ExitCode::FAILURE
+        match result {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(error) => {
+                let message = format!("Error: {error}");
+                match interaction.display("Error", &message) {
+                    Ok(InteractionResult::Back) => continue,
+                    Ok(InteractionResult::Value(()) | InteractionResult::Cancel) => {
+                        return ExitCode::FAILURE;
+                    }
+                    Err(display_error) => {
+                        eprintln!("{message}\nError: {display_error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
         }
     }
 }
