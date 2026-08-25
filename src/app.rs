@@ -452,6 +452,14 @@ impl<I: Interaction> App<I> {
         Self { interaction }
     }
 
+    /// Returns the interaction adapter after the workflow has completed.
+    ///
+    /// This lets command-line callers present a final renderer-owned error page
+    /// after the application has returned an [`AppError`].
+    pub fn into_interaction(self) -> I {
+        self.interaction
+    }
+
     /// Prompts for a Master password and persists a new empty Vault at `path`.
     pub fn init(&mut self, path: &Path) -> Result<(), AppError> {
         match fs::symlink_metadata(path) {

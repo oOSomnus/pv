@@ -1,6 +1,9 @@
 //! Full-screen terminal rendering and keyboard input for PV's interaction seam.
 
-use std::io::{self, Stdout, Write};
+use std::{
+    io::{self, Stdout, Write},
+    time::Duration,
+};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -14,6 +17,9 @@ use crossterm::{
 
 use crate::app::{Interaction, InteractionError, InteractionResult};
 
+/// The ASCII frames used for lightweight status feedback.
+const FEEDBACK_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+
 /// Identifies the top-level workflow displayed by the full-screen shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiWorkflow {
@@ -21,6 +27,95 @@ pub enum TuiWorkflow {
     Init,
     /// The user is unlocking and using an existing Vault.
     Open,
+}
+
+/// Identifies a renderer-local page in the workflow hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiPage {
+    /// The root page for the selected command workflow.
+    Workflow,
+    /// The home page shown after a Vault is unlocked.
+    VaultHome,
+    /// The Add workflow section.
+    Add,
+    /// The Get workflow section.
+    Get,
+    /// The Remove workflow section.
+    Remove,
+    /// The Key field or lookup page.
+    Key,
+    /// The Name field page.
+    Name,
+    /// The Value source and manual Value page.
+    Value,
+    /// The Generated value settings page.
+    GeneratorSettings,
+    /// The masked Generated value candidate page.
+    GeneratedValue,
+    /// The unsaved Credential review page.
+    Review,
+    /// The fuzzy Credential suggestion page.
+    Suggestions,
+    /// The Credential detail page.
+    Credential,
+    /// A destructive-operation confirmation page.
+    Confirmation,
+    /// The duplicate-Key decision page.
+    Duplicate,
+    /// A fatal workflow error page.
+    Error,
+}
+
+impl TuiPage {
+    /// Returns the short label used in the breadcrumb trail.
+    fn label(self, workflow: TuiWorkflow) -> &'static str {
+        match self {
+            Self::Workflow => match workflow {
+                TuiWorkflow::Init => "Init",
+                TuiWorkflow::Open => "Open",
+            },
+            Self::VaultHome => "Vault",
+            Self::Add => "Add",
+            Self::Get => "Get",
+            Self::Remove => "Remove",
+            Self::Key => "Key",
+            Self::Name => "Name",
+            Self::Value => "Value",
+            Self::GeneratorSettings => "Random",
+            Self::GeneratedValue => "Generated value",
+            Self::Review => "Review",
+            Self::Suggestions => "Suggestions",
+            Self::Credential => "Credential entry",
+            Self::Confirmation => "Confirmation",
+            Self::Duplicate => "Duplicate Key",
+            Self::Error => "Error",
+        }
+    }
+
+    /// Returns the page title displayed in the shared TUI header.
+    fn title(self, workflow: TuiWorkflow) -> &'static str {
+        match self {
+            Self::Workflow => match workflow {
+                TuiWorkflow::Init => "Initialize Vault",
+                TuiWorkflow::Open => "Unlock Vault",
+            },
+            Self::VaultHome => "Vault Home",
+            Self::Add => "Add Credential",
+            Self::Get => "Get Credential",
+            Self::Remove => "Remove Credential",
+            Self::Key => "Key",
+            Self::Name => "Name",
+            Self::Value => "Value",
+            Self::GeneratorSettings => "Random Generator",
+            Self::GeneratedValue => "Generated value",
+            Self::Review => "Review",
+            Self::Suggestions => "Credential Suggestions",
+            Self::Credential => "Credential entry",
+            Self::Confirmation => "Confirmation",
+            Self::Duplicate => "Duplicate Key",
+            Self::Error => "Error",
+        }
+    }
 }
 
 /// Owns the terminal session and adapts keyboard input to [`Interaction`].
@@ -31,8 +126,12 @@ pub struct TuiInteraction {
     workflow: TuiWorkflow,
     /// The last status message emitted by the application workflow.
     status: Option<String>,
-    /// The most recently rendered interaction context.
-    context: String,
+    /// The renderer-local hierarchy of the currently displayed page.
+    page_trail: Vec<TuiPage>,
+    /// The page selected by a menu and expected by the next interaction call.
+    pending_page: Option<TuiPage>,
+    /// The current frame used while waiting for terminal input after a status update.
+    feedback_frame: usize,
 }
 
 impl TuiInteraction {
@@ -58,7 +157,9 @@ impl TuiInteraction {
             output,
             workflow,
             status: None,
-            context: String::new(),
+            page_trail: vec![TuiPage::Workflow],
+            pending_page: None,
+            feedback_frame: 0,
         })
     }
 
@@ -67,53 +168,213 @@ impl TuiInteraction {
         InteractionError::new(format!("terminal interaction failed: {error}"))
     }
 
-    /// Returns the title for a rendered interaction page.
-    fn page_title(&self, prompt: &str) -> &'static str {
-        match self.workflow {
-            TuiWorkflow::Init => "Initialize Vault",
-            TuiWorkflow::Open if matches!(prompt, "Master password" | "Incorrect password") => {
-                "Unlock Vault"
+    /// Returns the title for the currently rendered interaction page.
+    fn page_title(&self) -> &'static str {
+        self.current_page().title(self.workflow)
+    }
+
+    /// Returns the complete breadcrumb trail for the current page.
+    fn breadcrumb(&self) -> String {
+        let pages = self
+            .page_trail
+            .iter()
+            .map(|page| page.label(self.workflow))
+            .collect::<Vec<_>>();
+        format!("PV / {}", pages.join(" / "))
+    }
+
+    /// Returns the page at the end of the current breadcrumb trail.
+    fn current_page(&self) -> TuiPage {
+        self.page_trail.last().copied().unwrap_or(TuiPage::Workflow)
+    }
+
+    /// Maps an application prompt to a renderer-local page kind.
+    fn page_for_prompt(&self, prompt: &str) -> Option<TuiPage> {
+        match prompt {
+            "Master password" => Some(match self.workflow {
+                TuiWorkflow::Init => TuiPage::Workflow,
+                TuiWorkflow::Open => TuiPage::Workflow,
+            }),
+            "Confirm master password" => Some(TuiPage::Workflow),
+            "Incorrect password" => Some(TuiPage::Workflow),
+            "Vault" => Some(TuiPage::VaultHome),
+            "Key" => Some(TuiPage::Key),
+            "Name" => Some(TuiPage::Name),
+            "Value" => Some(TuiPage::Value),
+            "Generated value length (8-100)" | "Numbers" | "Symbols" => {
+                Some(TuiPage::GeneratorSettings)
             }
-            TuiWorkflow::Open if prompt == "Vault" => "Vault Home",
-            TuiWorkflow::Open if prompt == "Credential entry" => "Credential entry",
-            TuiWorkflow::Open => "Vault",
+            "Generated value" => Some(TuiPage::GeneratedValue),
+            "Review" => Some(TuiPage::Review),
+            "Credential suggestions" => Some(TuiPage::Suggestions),
+            "Credential entry" => Some(TuiPage::Credential),
+            "Remove Credential entry" | "Confirm deletion" => Some(TuiPage::Confirmation),
+            "Duplicate Key" => Some(TuiPage::Duplicate),
+            "Error" => Some(TuiPage::Error),
+            "Credential not found" | "Status" => None,
+            _ => None,
         }
     }
 
-    /// Returns the breadcrumb context for a rendered interaction page.
-    fn breadcrumb(&self, prompt: &str) -> String {
-        let workflow = match self.workflow {
-            TuiWorkflow::Init => "Init",
-            TuiWorkflow::Open => "Open",
+    /// Enters the page associated with an application prompt and its pending menu transition.
+    fn enter_page(&mut self, prompt: &str) {
+        if prompt == "Status" {
+            return;
+        }
+        if let Some(pending_page) = self.pending_page.take() {
+            self.activate_page(pending_page);
+        }
+        if let Some(page) = self.page_for_prompt(prompt) {
+            self.activate_page(page);
+        }
+    }
+
+    /// Activates a page while retaining only its meaningful parent hierarchy.
+    fn activate_page(&mut self, page: TuiPage) {
+        match page {
+            TuiPage::Workflow => self.reset_to_workflow(),
+            TuiPage::VaultHome => self.reset_to_home(),
+            TuiPage::Add | TuiPage::Get | TuiPage::Remove => {
+                self.move_under(page, &[TuiPage::VaultHome]);
+            }
+            TuiPage::Key => self.move_under(page, &[TuiPage::Add, TuiPage::Get, TuiPage::Remove]),
+            TuiPage::Name | TuiPage::Value | TuiPage::Review => {
+                self.move_under(page, &[TuiPage::Add]);
+            }
+            TuiPage::GeneratorSettings => self.move_under(page, &[TuiPage::Value]),
+            TuiPage::GeneratedValue => self.move_under(page, &[TuiPage::GeneratorSettings]),
+            TuiPage::Suggestions => {
+                self.move_under(page, &[TuiPage::Key, TuiPage::Get, TuiPage::Remove]);
+            }
+            TuiPage::Credential => {
+                self.move_under(
+                    page,
+                    &[
+                        TuiPage::Suggestions,
+                        TuiPage::Key,
+                        TuiPage::Get,
+                        TuiPage::Remove,
+                    ],
+                );
+            }
+            TuiPage::Confirmation => {
+                self.move_under(page, &[TuiPage::Suggestions, TuiPage::Key, TuiPage::Remove])
+            }
+            TuiPage::Duplicate => self.move_under(page, &[TuiPage::Review, TuiPage::Add]),
+            TuiPage::Error => {
+                self.page_trail.truncate(1);
+                self.page_trail.push(TuiPage::Error);
+            }
+        }
+    }
+
+    /// Places `page` immediately below its nearest active parent page.
+    fn move_under(&mut self, page: TuiPage, parents: &[TuiPage]) {
+        if let Some(page_index) = self.page_trail.iter().rposition(|current| *current == page) {
+            self.page_trail.truncate(page_index + 1);
+            return;
+        }
+        if let Some(parent_index) = self
+            .page_trail
+            .iter()
+            .rposition(|current| parents.contains(current))
+        {
+            self.page_trail.truncate(parent_index + 1);
+        }
+        self.page_trail.push(page);
+    }
+
+    /// Resets the breadcrumb trail to the selected command workflow.
+    fn reset_to_workflow(&mut self) {
+        self.page_trail.clear();
+        self.page_trail.push(TuiPage::Workflow);
+        self.pending_page = None;
+    }
+
+    /// Resets the breadcrumb trail to the unlocked Vault home page.
+    fn reset_to_home(&mut self) {
+        self.page_trail.clear();
+        self.page_trail
+            .extend([TuiPage::Workflow, TuiPage::VaultHome]);
+        self.pending_page = None;
+    }
+
+    /// Records the child page implied by a successful menu selection.
+    fn remember_selection(&mut self, prompt: &str, options: &[&str], selected: usize) {
+        self.pending_page = match (prompt, options.get(selected).copied()) {
+            ("Vault", Some("Add")) => Some(TuiPage::Add),
+            ("Vault", Some("Get")) => Some(TuiPage::Get),
+            ("Vault", Some("Remove")) => Some(TuiPage::Remove),
+            ("Value", Some("Random")) => Some(TuiPage::GeneratorSettings),
+            ("Credential suggestions", Some("Cancel")) => None,
+            ("Credential suggestions", Some(_)) if self.page_trail.contains(&TuiPage::Get) => {
+                Some(TuiPage::Credential)
+            }
+            ("Credential suggestions", Some(_)) => None,
+            _ => None,
         };
-        let context = if prompt.is_empty() {
-            self.context.as_str()
+    }
+
+    /// Updates the renderer hierarchy after a returned interaction result.
+    fn finish_navigation<T>(&mut self, result: &InteractionResult<T>) {
+        match result {
+            InteractionResult::Value(_) => {}
+            InteractionResult::Back => {
+                self.pending_page = None;
+                if self.page_trail.len() > 1 {
+                    self.page_trail.pop();
+                }
+            }
+            InteractionResult::Cancel => self.reset_to_workflow(),
+        }
+    }
+
+    /// Clears status and records the navigation represented by `result`.
+    fn complete<T>(&mut self, result: InteractionResult<T>) -> InteractionResult<T> {
+        self.status = None;
+        self.finish_navigation(&result);
+        result
+    }
+
+    /// Returns whether the current page has an immediate parent for Back navigation.
+    fn can_go_back(&self) -> bool {
+        self.page_trail.len() > 1
+            && !matches!(self.current_page(), TuiPage::Workflow | TuiPage::VaultHome)
+    }
+
+    /// Builds a footer with shortcuts appropriate to the current page hierarchy.
+    fn navigation_footer(&self, action: &str) -> String {
+        if self.can_go_back() {
+            format!("{action}   Esc Back   Ctrl+C Cancel")
         } else {
-            prompt
-        };
-        if context.is_empty() {
-            format!("PV / {workflow}")
-        } else {
-            format!("PV / {workflow} / {context}")
+            format!("{action}   Ctrl+C Cancel")
+        }
+    }
+
+    /// Reads the next terminal event while refreshing the status spinner on timeout.
+    ///
+    /// Returns an [`InteractionError`] when terminal polling, reading, or rendering fails.
+    fn read_event(&mut self, body: &[String], footer: &str) -> Result<Event, InteractionError> {
+        if self.status.is_none() {
+            return event::read().map_err(Self::terminal_error);
+        }
+        loop {
+            if event::poll(Duration::from_millis(120)).map_err(Self::terminal_error)? {
+                return event::read().map_err(Self::terminal_error);
+            }
+            self.feedback_frame = (self.feedback_frame + 1) % FEEDBACK_FRAMES.len();
+            self.draw(body, footer)?;
         }
     }
 
     /// Draws the shared title, context, status bar, body, and footer shell.
     ///
     /// Returns an [`InteractionError`] when terminal sizing, rendering, or flushing fails.
-    fn draw(
-        &mut self,
-        prompt: &str,
-        body: &[String],
-        footer: &str,
-    ) -> Result<(), InteractionError> {
-        if !prompt.is_empty() {
-            self.context = prompt.to_owned();
-        }
+    fn draw(&mut self, body: &[String], footer: &str) -> Result<(), InteractionError> {
         let (width, height) = terminal::size().map_err(Self::terminal_error)?;
         let body_width = usize::from(width.saturating_sub(8));
-        let title = self.page_title(prompt);
-        let breadcrumb = self.breadcrumb(prompt);
+        let title = self.page_title();
+        let breadcrumb = self.breadcrumb();
         let divider = "─".repeat(usize::from(width.max(1)));
         let mut lines = Vec::with_capacity(body.len() + 1);
         if let Some(status) = &self.status {
@@ -160,11 +421,14 @@ impl TuiInteraction {
 
         let status_row = height.saturating_sub(3);
         let footer_row = height.saturating_sub(1);
-        let status_text = self
-            .status
-            .as_deref()
-            .unwrap_or("Ready")
-            .replace('\n', " · ");
+        let status_text = match self.status.as_deref() {
+            Some(status) => format!(
+                "{} {}",
+                status.replace('\n', " · "),
+                FEEDBACK_FRAMES[self.feedback_frame]
+            ),
+            None => "Ready".to_owned(),
+        };
         queue!(
             self.output,
             MoveTo(0, status_row),
@@ -196,6 +460,7 @@ impl TuiInteraction {
     ) -> Result<InteractionResult<String>, InteractionError> {
         let mut value = String::new();
         loop {
+            self.enter_page(prompt);
             let displayed = if hidden {
                 let character_count = if value.is_empty() {
                     default.map_or(0, |default| default.chars().count())
@@ -210,17 +475,13 @@ impl TuiInteraction {
             } else {
                 value.clone()
             };
-            self.draw(
-                prompt,
-                &[prompt.to_owned(), String::new(), displayed],
-                "Enter Submit   Esc Back   Ctrl+C Cancel",
-            )?;
-
-            match event::read().map_err(Self::terminal_error)? {
+            let footer = self.navigation_footer("Enter Submit");
+            let body = [prompt.to_owned(), String::new(), displayed];
+            self.draw(&body, &footer)?;
+            match self.read_event(&body, &footer)? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if is_cancel_key(key) {
-                        self.status = None;
-                        return Ok(InteractionResult::Cancel);
+                        return Ok(self.complete(InteractionResult::Cancel));
                     }
                     match key.code {
                         KeyCode::Enter => {
@@ -228,12 +489,10 @@ impl TuiInteraction {
                                 .filter(|_| value.is_empty())
                                 .unwrap_or(value.as_str())
                                 .to_owned();
-                            self.status = None;
-                            return Ok(InteractionResult::Value(result));
+                            return Ok(self.complete(InteractionResult::Value(result)));
                         }
                         KeyCode::Esc => {
-                            self.status = None;
-                            return Ok(InteractionResult::Back);
+                            return Ok(self.complete(InteractionResult::Back));
                         }
                         KeyCode::Backspace => {
                             value.pop();
@@ -269,6 +528,7 @@ impl TuiInteraction {
         }
         let mut selected = 0;
         loop {
+            self.enter_page(prompt);
             let mut body: Vec<String> = if message.is_empty() {
                 Vec::new()
             } else {
@@ -284,26 +544,21 @@ impl TuiInteraction {
                     format!("  {option}")
                 }
             }));
-            self.draw(
-                prompt,
-                &body,
-                "↑↓ Navigate   Enter Select   Esc Back   Ctrl+C Cancel",
-            )?;
+            let footer = self.navigation_footer("↑↓ Navigate   Enter Select");
+            self.draw(&body, &footer)?;
 
-            match event::read().map_err(Self::terminal_error)? {
+            match self.read_event(&body, &footer)? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if is_cancel_key(key) {
-                        self.status = None;
-                        return Ok(InteractionResult::Cancel);
+                        return Ok(self.complete(InteractionResult::Cancel));
                     }
                     match key.code {
                         KeyCode::Enter => {
-                            self.status = None;
-                            return Ok(InteractionResult::Value(selected));
+                            self.remember_selection(prompt, options, selected);
+                            return Ok(self.complete(InteractionResult::Value(selected)));
                         }
                         KeyCode::Esc => {
-                            self.status = None;
-                            return Ok(InteractionResult::Back);
+                            return Ok(self.complete(InteractionResult::Back));
                         }
                         KeyCode::Up => {
                             selected = if selected == 0 {
@@ -331,22 +586,21 @@ impl TuiInteraction {
         body: &[String],
     ) -> Result<InteractionResult<()>, InteractionError> {
         loop {
-            self.draw(prompt, body, "Enter Continue   Esc Back   Ctrl+C Cancel")?;
+            self.enter_page(prompt);
+            let footer = self.navigation_footer("Enter Continue");
+            self.draw(body, &footer)?;
 
-            match event::read().map_err(Self::terminal_error)? {
+            match self.read_event(body, &footer)? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if is_cancel_key(key) {
-                        self.status = None;
-                        return Ok(InteractionResult::Cancel);
+                        return Ok(self.complete(InteractionResult::Cancel));
                     }
                     match key.code {
                         KeyCode::Enter => {
-                            self.status = None;
-                            return Ok(InteractionResult::Value(()));
+                            return Ok(self.complete(InteractionResult::Value(())));
                         }
                         KeyCode::Esc => {
-                            self.status = None;
-                            return Ok(InteractionResult::Back);
+                            return Ok(self.complete(InteractionResult::Back));
                         }
                         _ => {}
                     }
@@ -409,7 +663,7 @@ impl Interaction for TuiInteraction {
     /// Shows a status message in the shared shell without blocking the workflow.
     fn message(&mut self, message: &str) -> Result<(), InteractionError> {
         self.status = Some(message.to_owned());
-        self.draw("Status", &[], "Enter Continue   Esc Back   Ctrl+C Cancel")
+        self.draw(&[], "")
     }
 
     /// Displays a complete Credential page and returns its navigation action.

@@ -58,6 +58,15 @@ impl ScriptedInteraction {
         }
     }
 
+    /// Adds scripted hidden-input results, including Back and Cancel actions.
+    fn with_password_results(
+        mut self,
+        passwords: impl IntoIterator<Item = InteractionResult<String>>,
+    ) -> Self {
+        self.passwords = passwords.into_iter().collect();
+        self
+    }
+
     /// Adds a scripted sequence of visible text inputs to this adapter.
     fn with_inputs(mut self, inputs: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.inputs = inputs
@@ -296,6 +305,35 @@ fn init_reprompts_when_a_master_password_is_empty() {
         ["Master password cannot be empty."]
     );
     assert!(path.exists());
+}
+
+/// Verifies that Cancel from either Init password page leaves no partial Vault behind.
+#[test]
+fn init_cancel_from_each_password_page_leaves_no_vault() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let first_path = directory.path().join("cancel-first-password.vault");
+    let mut first_app = App::new(
+        ScriptedInteraction::with_passwords(Vec::<String>::new())
+            .with_password_results([InteractionResult::Cancel]),
+    );
+
+    first_app
+        .init(&first_path)
+        .expect("cancelling the first password should be clean");
+    assert!(!first_path.exists());
+
+    let second_path = directory.path().join("cancel-confirm-password.vault");
+    let mut second_app = App::new(
+        ScriptedInteraction::with_passwords(Vec::<String>::new()).with_password_results([
+            InteractionResult::Value("master password".to_owned()),
+            InteractionResult::Cancel,
+        ]),
+    );
+
+    second_app
+        .init(&second_path)
+        .expect("cancelling password confirmation should be clean");
+    assert!(!second_path.exists());
 }
 
 /// Verifies that opening an empty Vault enters a menu and exits without mutation.
