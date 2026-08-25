@@ -3,18 +3,10 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use pv::app::{App, DEFAULT_VAULT_PATH, DialoguerInteraction};
-
-/// The banner shown when the command-line application starts.
-const ASCII_ART: &str = r#"
-█ ▄▄     ▄
-█   █     █
-█▀▀▀ █     █
-█     █    █
- █     █  █
-  ▀     █▐
-        ▐
-"#;
+use pv::{
+    app::{App, DEFAULT_VAULT_PATH},
+    tui::{TuiInteraction, TuiWorkflow},
+};
 
 /// Parsed command-line arguments for the PV application.
 #[derive(Debug, Parser)]
@@ -42,15 +34,27 @@ enum Commands {
 
 /// Parses the command line and runs the selected Vault workflow.
 fn main() -> ExitCode {
-    println!("{ASCII_ART}");
     let cli = Cli::parse();
-    let mut app = App::new(DialoguerInteraction);
+    let workflow = match &cli.command {
+        Commands::Init { .. } => TuiWorkflow::Init,
+        Commands::Open { .. } => TuiWorkflow::Open,
+    };
+    let interaction = match TuiInteraction::new(workflow) {
+        Ok(interaction) => interaction,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let result = match cli.command {
-        Commands::Init { path } => app.init(&path.unwrap_or_else(default_vault_path)),
-        Commands::Open { path } => app
-            .open(&path.unwrap_or_else(default_vault_path))
-            .map(|_| ()),
+    let result = {
+        let mut app = App::new(interaction);
+        match cli.command {
+            Commands::Init { path } => app.init(&path.unwrap_or_else(default_vault_path)),
+            Commands::Open { path } => app
+                .open(&path.unwrap_or_else(default_vault_path))
+                .map(|_| ()),
+        }
     };
 
     match result {

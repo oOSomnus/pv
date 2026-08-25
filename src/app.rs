@@ -18,34 +18,47 @@ use crate::{
 /// The Vault path used by the command line when the caller omits a path.
 pub const DEFAULT_VAULT_PATH: &str = "./pv.vault";
 
+/// Represents a value or renderer-neutral navigation action returned by an adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractionResult<T> {
+    /// Returns the ordinary value collected by the interaction.
+    Value(T),
+    /// Moves to the immediate parent of the current interaction step.
+    Back,
+    /// Abandons the current interaction flow.
+    Cancel,
+}
+
 /// Supplies the user interaction needed by the Vault workflows.
 pub trait Interaction {
-    /// Reads a hidden password from the user.
-    fn password(&mut self, prompt: &str) -> Result<String, InteractionError>;
+    /// Reads a hidden password or returns a renderer-neutral navigation action.
+    fn password(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError>;
 
-    /// Reads visible text from the user, or returns an error when unsupported.
-    fn input(&mut self, prompt: &str) -> Result<String, InteractionError> {
-        Err(InteractionError::new(format!(
-            "visible input is unavailable for prompt {prompt}"
-        )))
-    }
+    /// Reads visible text or returns a renderer-neutral navigation action.
+    fn input(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError>;
 
-    /// Reads visible text and supplies `default` when the adapter returns empty text.
+    /// Reads visible text, applies `default` to an empty value, or returns a navigation action.
     fn input_with_default(
         &mut self,
         prompt: &str,
         default: &str,
-    ) -> Result<String, InteractionError> {
-        let input = self.input(prompt)?;
-        if input.trim().is_empty() {
-            Ok(default.to_owned())
-        } else {
-            Ok(input)
+    ) -> Result<InteractionResult<String>, InteractionError> {
+        match self.input(prompt)? {
+            InteractionResult::Value(input) if input.trim().is_empty() => {
+                Ok(InteractionResult::Value(default.to_owned()))
+            }
+            InteractionResult::Value(input) => Ok(InteractionResult::Value(input)),
+            InteractionResult::Back => Ok(InteractionResult::Back),
+            InteractionResult::Cancel => Ok(InteractionResult::Cancel),
         }
     }
 
-    /// Presents a menu and returns the selected option index.
-    fn choose(&mut self, prompt: &str, options: &[&str]) -> Result<usize, InteractionError>;
+    /// Presents a menu and returns a selected index or navigation action.
+    fn choose(
+        &mut self,
+        prompt: &str,
+        options: &[&str],
+    ) -> Result<InteractionResult<usize>, InteractionError>;
 
     /// Displays an informational or error message to the user.
     fn message(&mut self, message: &str) -> Result<(), InteractionError>;
@@ -64,18 +77,20 @@ pub struct DialoguerInteraction;
 
 impl Interaction for DialoguerInteraction {
     /// Reads a hidden password using dialoguer's password prompt.
-    fn password(&mut self, prompt: &str) -> Result<String, InteractionError> {
+    fn password(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError> {
         Password::new()
             .with_prompt(prompt)
             .interact()
+            .map(InteractionResult::Value)
             .map_err(|error| InteractionError::new(error.to_string()))
     }
 
     /// Reads visible text using dialoguer's text prompt.
-    fn input(&mut self, prompt: &str) -> Result<String, InteractionError> {
+    fn input(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError> {
         Input::<String>::new()
             .with_prompt(prompt)
             .interact_text()
+            .map(InteractionResult::Value)
             .map_err(|error| InteractionError::new(error.to_string()))
     }
 
@@ -84,16 +99,21 @@ impl Interaction for DialoguerInteraction {
         &mut self,
         prompt: &str,
         default: &str,
-    ) -> Result<String, InteractionError> {
+    ) -> Result<InteractionResult<String>, InteractionError> {
         Input::<String>::new()
             .with_prompt(prompt)
             .default(default.to_owned())
             .interact_text()
+            .map(InteractionResult::Value)
             .map_err(|error| InteractionError::new(error.to_string()))
     }
 
     /// Displays a dialoguer selection menu and returns its selected index.
-    fn choose(&mut self, prompt: &str, options: &[&str]) -> Result<usize, InteractionError> {
+    fn choose(
+        &mut self,
+        prompt: &str,
+        options: &[&str],
+    ) -> Result<InteractionResult<usize>, InteractionError> {
         if options.is_empty() {
             return Err(InteractionError::new("no menu options are available"));
         }
@@ -102,6 +122,7 @@ impl Interaction for DialoguerInteraction {
             .items(options)
             .default(0)
             .interact()
+            .map(InteractionResult::Value)
             .map_err(|error| InteractionError::new(error.to_string()))
     }
 
@@ -206,9 +227,9 @@ pub struct App<I> {
 /// Describes how an open Vault session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenResult {
-    /// The user selected Exit from the open Vault menu.
+    /// The user selected Exit or a root-level navigation action from the Vault home.
     Exited,
-    /// The user cancelled after an incorrect password.
+    /// The user cancelled or returned from the unlock workflow.
     Cancelled,
 }
 
@@ -235,8 +256,12 @@ impl<I: Interaction> App<I> {
             }
         }
 
-        let password = self.ask_non_empty_password("Master password")?;
-        let confirmation = self.ask_non_empty_password("Confirm master password")?;
+        let Some(password) = self.ask_non_empty_password("Master password")? else {
+            return Ok(());
+        };
+        let Some(confirmation) = self.ask_non_empty_password("Confirm master password")? else {
+            return Ok(());
+        };
         if password != confirmation {
             return Err(AppError::PasswordMismatch);
         }
@@ -282,7 +307,12 @@ impl<I: Interaction> App<I> {
         })?;
 
         loop {
-            let password = self.interaction.password("Master password")?;
+            let password = match self.interaction.password("Master password")? {
+                InteractionResult::Value(password) => password,
+                InteractionResult::Back | InteractionResult::Cancel => {
+                    return Ok(OpenResult::Cancelled);
+                }
+            };
             match Vault::unlock(&bytes, &password) {
                 Ok(mut vault) => {
                     return self.run_open_session(path, &mut vault);
@@ -294,9 +324,11 @@ impl<I: Interaction> App<I> {
                         .interaction
                         .choose("Incorrect password", &["Retry", "Cancel"])?;
                     match choice {
-                        0 => continue,
-                        1 => return Ok(OpenResult::Cancelled),
-                        choice => {
+                        InteractionResult::Value(0) => continue,
+                        InteractionResult::Value(1)
+                        | InteractionResult::Back
+                        | InteractionResult::Cancel => return Ok(OpenResult::Cancelled),
+                        InteractionResult::Value(choice) => {
                             return Err(AppError::InvalidChoice {
                                 prompt: "Incorrect password",
                                 choice,
@@ -316,11 +348,13 @@ impl<I: Interaction> App<I> {
                 .interaction
                 .choose("Vault", &["Add", "Get", "Remove", "Exit"])?;
             match choice {
-                0 => self.add_credential(path, vault)?,
-                1 => self.get_credential(vault)?,
-                2 => self.remove_credential(path, vault)?,
-                3 => return Ok(OpenResult::Exited),
-                choice => {
+                InteractionResult::Value(0) => self.add_credential(path, vault)?,
+                InteractionResult::Value(1) => self.get_credential(vault)?,
+                InteractionResult::Value(2) => self.remove_credential(path, vault)?,
+                InteractionResult::Value(3)
+                | InteractionResult::Back
+                | InteractionResult::Cancel => return Ok(OpenResult::Exited),
+                InteractionResult::Value(choice) => {
                     return Err(AppError::InvalidChoice {
                         prompt: "Vault",
                         choice,
@@ -361,9 +395,11 @@ impl<I: Interaction> App<I> {
             .interaction
             .choose(prompt, &[positive_choice, "Cancel"])?;
         match choice {
-            0 => Ok(true),
-            1 => Ok(false),
-            choice => Err(AppError::InvalidChoice { prompt, choice }),
+            InteractionResult::Value(0) => Ok(true),
+            InteractionResult::Value(1) | InteractionResult::Back | InteractionResult::Cancel => {
+                Ok(false)
+            }
+            InteractionResult::Value(choice) => Err(AppError::InvalidChoice { prompt, choice }),
         }
     }
 
@@ -373,7 +409,10 @@ impl<I: Interaction> App<I> {
         vault: &'vault Vault,
     ) -> Result<Option<&'vault Credential>, AppError> {
         loop {
-            let query = self.interaction.input("Key")?;
+            let query = match self.interaction.input("Key")? {
+                InteractionResult::Value(query) => query,
+                InteractionResult::Back | InteractionResult::Cancel => return Ok(None),
+            };
             if let Some(credential) = vault.find_credential(&query) {
                 return Ok(Some(credential));
             }
@@ -391,11 +430,14 @@ impl<I: Interaction> App<I> {
                     .interaction
                     .choose("Credential suggestions", &option_references)?;
                 match choice {
-                    choice if choice < suggestions.len() => {
+                    InteractionResult::Value(choice) if choice < suggestions.len() => {
                         return Ok(Some(suggestions[choice]));
                     }
-                    choice if choice == suggestions.len() => return Ok(None),
-                    choice => {
+                    InteractionResult::Value(choice) if choice == suggestions.len() => {
+                        return Ok(None);
+                    }
+                    InteractionResult::Back | InteractionResult::Cancel => return Ok(None),
+                    InteractionResult::Value(choice) => {
                         return Err(AppError::InvalidChoice {
                             prompt: "Credential suggestions",
                             choice,
@@ -408,9 +450,11 @@ impl<I: Interaction> App<I> {
                 .interaction
                 .choose("Credential not found", &["Retry", "Cancel"])?;
             match choice {
-                0 => {}
-                1 => return Ok(None),
-                choice => {
+                InteractionResult::Value(0) => {}
+                InteractionResult::Value(1)
+                | InteractionResult::Back
+                | InteractionResult::Cancel => return Ok(None),
+                InteractionResult::Value(choice) => {
                     return Err(AppError::InvalidChoice {
                         prompt: "Credential not found",
                         choice,
@@ -426,24 +470,34 @@ impl<I: Interaction> App<I> {
             .interaction
             .choose("Value type", &["Manual Value", "Generated value"])?
         {
-            0 => false,
-            1 => true,
-            choice => {
+            InteractionResult::Value(0) => false,
+            InteractionResult::Value(1) => true,
+            InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
+            InteractionResult::Value(choice) => {
                 return Err(AppError::InvalidChoice {
                     prompt: "Value type",
                     choice,
                 });
             }
         };
-        let key = self.interaction.input("Key")?;
-        let name = self.interaction.input("Name")?;
+        let key = match self.interaction.input("Key")? {
+            InteractionResult::Value(key) => key,
+            InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
+        };
+        let name = match self.interaction.input("Name")? {
+            InteractionResult::Value(name) => name,
+            InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
+        };
         let value = if use_generated_value {
             match self.generated_value()? {
                 Some(value) => value,
                 None => return Ok(()),
             }
         } else {
-            self.interaction.password("Value")?
+            match self.interaction.password("Value")? {
+                InteractionResult::Value(value) => value,
+                InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
+            }
         };
         let credential = Credential::new(key, name, value);
 
@@ -454,9 +508,11 @@ impl<I: Interaction> App<I> {
                 .interaction
                 .choose("Duplicate Key", &["Overwrite", "Cancel"])?;
             match choice {
-                0 => {}
-                1 => return Ok(()),
-                choice => {
+                InteractionResult::Value(0) => {}
+                InteractionResult::Value(1)
+                | InteractionResult::Back
+                | InteractionResult::Cancel => return Ok(()),
+                InteractionResult::Value(choice) => {
                     return Err(AppError::InvalidChoice {
                         prompt: "Duplicate Key",
                         choice,
@@ -471,7 +527,9 @@ impl<I: Interaction> App<I> {
 
     /// Collects Generated value options and lets the user review each generated value.
     fn generated_value(&mut self) -> Result<Option<String>, AppError> {
-        let options = self.generated_value_options()?;
+        let Some(options) = self.generated_value_options()? else {
+            return Ok(None);
+        };
         let mut previous = None;
 
         loop {
@@ -487,10 +545,12 @@ impl<I: Interaction> App<I> {
                 .interaction
                 .choose("Generated value", &["Confirm", "Regenerate", "Cancel"])?;
             match choice {
-                0 => return Ok(Some(value)),
-                1 => {}
-                2 => return Ok(None),
-                choice => {
+                InteractionResult::Value(0) => return Ok(Some(value)),
+                InteractionResult::Value(1) => {}
+                InteractionResult::Value(2)
+                | InteractionResult::Back
+                | InteractionResult::Cancel => return Ok(None),
+                InteractionResult::Value(choice) => {
                     return Err(AppError::InvalidChoice {
                         prompt: "Generated value",
                         choice,
@@ -501,12 +561,16 @@ impl<I: Interaction> App<I> {
     }
 
     /// Prompts for a valid Generated value length and its optional character classes.
-    fn generated_value_options(&mut self) -> Result<GeneratedValueOptions, AppError> {
+    fn generated_value_options(&mut self) -> Result<Option<GeneratedValueOptions>, AppError> {
         let default_length = DEFAULT_LENGTH.to_string();
         let length = loop {
             let entered = self
                 .interaction
                 .input_with_default("Generated value length (10-100)", &default_length)?;
+            let entered = match entered {
+                InteractionResult::Value(entered) => entered,
+                InteractionResult::Back | InteractionResult::Cancel => return Ok(None),
+            };
             let trimmed = entered.trim();
             let length = if trimmed.is_empty() {
                 DEFAULT_LENGTH
@@ -529,22 +593,27 @@ impl<I: Interaction> App<I> {
             }
         };
 
-        let include_digits = self.choose_generated_option("Include digits")?;
-        let include_punctuation = self.choose_generated_option("Include punctuation")?;
-        Ok(GeneratedValueOptions::new(
+        let Some(include_digits) = self.choose_generated_option("Include digits")? else {
+            return Ok(None);
+        };
+        let Some(include_punctuation) = self.choose_generated_option("Include punctuation")? else {
+            return Ok(None);
+        };
+        Ok(Some(GeneratedValueOptions::new(
             length,
             include_digits,
             include_punctuation,
-        )?)
+        )?))
     }
 
     /// Asks whether one optional Generated value character class should be enabled.
-    fn choose_generated_option(&mut self, prompt: &'static str) -> Result<bool, AppError> {
+    fn choose_generated_option(&mut self, prompt: &'static str) -> Result<Option<bool>, AppError> {
         let choice = self.interaction.choose(prompt, &["Yes", "No"])?;
         match choice {
-            0 => Ok(true),
-            1 => Ok(false),
-            choice => Err(AppError::InvalidChoice { prompt, choice }),
+            InteractionResult::Value(0) => Ok(Some(true)),
+            InteractionResult::Value(1) => Ok(Some(false)),
+            InteractionResult::Back | InteractionResult::Cancel => Ok(None),
+            InteractionResult::Value(choice) => Err(AppError::InvalidChoice { prompt, choice }),
         }
     }
 
@@ -586,11 +655,14 @@ impl<I: Interaction> App<I> {
     }
 
     /// Re-prompts until the interaction adapter returns a non-empty password.
-    fn ask_non_empty_password(&mut self, prompt: &str) -> Result<String, AppError> {
+    fn ask_non_empty_password(&mut self, prompt: &str) -> Result<Option<String>, AppError> {
         loop {
-            let password = self.interaction.password(prompt)?;
+            let password = match self.interaction.password(prompt)? {
+                InteractionResult::Value(password) => password,
+                InteractionResult::Back | InteractionResult::Cancel => return Ok(None),
+            };
             if !password.is_empty() {
-                return Ok(password);
+                return Ok(Some(password));
             }
             self.interaction
                 .message("Master password cannot be empty.")?;

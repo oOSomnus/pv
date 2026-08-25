@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::VecDeque, path::Path, rc::Rc};
 
 use bincode::{Encode, config, encode_to_vec};
 use pv::{
-    app::{App, Interaction, InteractionError},
+    app::{App, Interaction, InteractionError, InteractionResult},
     vault::{Credential, Vault},
 };
 use tempfile::tempdir;
@@ -87,29 +87,36 @@ impl ScriptedInteraction {
 
 impl Interaction for ScriptedInteraction {
     /// Returns the next scripted password response.
-    fn password(&mut self, prompt: &str) -> Result<String, InteractionError> {
+    fn password(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError> {
         self.password_prompts.borrow_mut().push(prompt.to_owned());
         self.passwords
             .pop_front()
             .ok_or_else(|| InteractionError::new("no scripted password available"))
+            .map(InteractionResult::Value)
     }
 
     /// Returns the next scripted visible text response.
-    fn input(&mut self, prompt: &str) -> Result<String, InteractionError> {
+    fn input(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError> {
         self.input_prompts.borrow_mut().push(prompt.to_owned());
         self.inputs
             .pop_front()
             .ok_or_else(|| InteractionError::new("no scripted input available"))
+            .map(InteractionResult::Value)
     }
 
     /// Returns the next scripted menu selection.
-    fn choose(&mut self, _prompt: &str, options: &[&str]) -> Result<usize, InteractionError> {
+    fn choose(
+        &mut self,
+        _prompt: &str,
+        options: &[&str],
+    ) -> Result<InteractionResult<usize>, InteractionError> {
         self.choice_options
             .borrow_mut()
             .push(options.iter().map(|option| (*option).to_owned()).collect());
         self.choices
             .pop_front()
             .ok_or_else(|| InteractionError::new("no scripted choice available"))
+            .map(InteractionResult::Value)
     }
 
     /// Records a workflow message for later assertions.

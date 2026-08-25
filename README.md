@@ -11,6 +11,7 @@ PV is a local command-line password manager for storing website credentials in a
 - Find credentials by case-insensitive, whitespace-trimmed Key matching, with up to three fuzzy suggestions for typos.
 - Remove credentials only after two independent confirmations.
 - Persist every successful mutation immediately.
+- Run `init` and `open` in the same full-screen terminal interface with persistent context and keyboard action hints.
 
 ## Usage
 
@@ -28,7 +29,7 @@ cargo run -- init ./personal.vault
 cargo run -- open ./personal.vault
 ```
 
-After unlocking, `open` provides an interactive menu with `Add`, `Get`, `Remove`, and `Exit` actions. Cancelled operations leave the Vault unchanged.
+Both commands use the full-screen terminal interface. Use the arrow keys and Enter to navigate, Esc for Back, and Ctrl+C to Cancel. After unlocking, `open` provides an interactive menu with `Add`, `Get`, `Remove`, and `Exit` actions. Cancelled operations leave the Vault unchanged.
 
 ## Security
 
