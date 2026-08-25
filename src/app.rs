@@ -34,6 +34,22 @@ pub trait Interaction {
     /// Reads a hidden password or returns a renderer-neutral navigation action.
     fn password(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError>;
 
+    /// Reads a hidden password, applying `default` when the submitted value is empty.
+    fn password_with_default(
+        &mut self,
+        prompt: &str,
+        default: &str,
+    ) -> Result<InteractionResult<String>, InteractionError> {
+        match self.password(prompt)? {
+            InteractionResult::Value(value) if value.is_empty() => {
+                Ok(InteractionResult::Value(default.to_owned()))
+            }
+            InteractionResult::Value(value) => Ok(InteractionResult::Value(value)),
+            InteractionResult::Back => Ok(InteractionResult::Back),
+            InteractionResult::Cancel => Ok(InteractionResult::Cancel),
+        }
+    }
+
     /// Reads visible text or returns a renderer-neutral navigation action.
     fn input(&mut self, prompt: &str) -> Result<InteractionResult<String>, InteractionError>;
 
@@ -222,6 +238,37 @@ pub enum AppError {
 pub struct App<I> {
     /// The adapter used to collect input and present messages and menus.
     interaction: I,
+}
+
+/// Stores manual Add fields until the user explicitly saves the Credential.
+#[derive(Default)]
+struct CredentialDraft {
+    /// The website or service identifier entered for the pending Credential.
+    key: String,
+    /// The login identity entered for the pending Credential.
+    name: String,
+    /// The opaque secret entered for the pending Credential.
+    value: String,
+}
+
+/// Identifies the current step in the manual Credential Draft workflow.
+enum ManualDraftStep {
+    /// Collects or edits the pending Credential Key.
+    Key,
+    /// Collects or edits the pending Credential Name.
+    Name,
+    /// Collects or edits the pending opaque Credential Value.
+    Value,
+    /// Presents the pending Credential for a save decision.
+    Review,
+}
+
+/// Describes how the manual Draft workflow should return to its parent.
+enum ManualDraftOutcome {
+    /// Returns from the Key step to the Add value-type selection.
+    BackToValueType,
+    /// Completes the Add interaction, whether by Save or Cancel.
+    Completed,
 }
 
 /// Describes how an open Vault session ended.
@@ -466,20 +513,149 @@ impl<I: Interaction> App<I> {
 
     /// Collects one Credential using a manual or Generated value and persists it after duplicate handling.
     fn add_credential(&mut self, path: &Path, vault: &mut Vault) -> Result<(), AppError> {
-        let use_generated_value = match self
-            .interaction
-            .choose("Value type", &["Manual Value", "Generated value"])?
-        {
-            InteractionResult::Value(0) => false,
-            InteractionResult::Value(1) => true,
-            InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
-            InteractionResult::Value(choice) => {
-                return Err(AppError::InvalidChoice {
-                    prompt: "Value type",
-                    choice,
-                });
+        let mut draft = CredentialDraft::default();
+
+        loop {
+            let use_generated_value = match self
+                .interaction
+                .choose("Value type", &["Manual Value", "Generated value"])?
+            {
+                InteractionResult::Value(0) => false,
+                InteractionResult::Value(1) => true,
+                InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
+                InteractionResult::Value(choice) => {
+                    return Err(AppError::InvalidChoice {
+                        prompt: "Value type",
+                        choice,
+                    });
+                }
+            };
+
+            if use_generated_value {
+                return self.add_generated_credential(path, vault);
             }
-        };
+
+            match self.add_manual_credential(path, vault, &mut draft)? {
+                ManualDraftOutcome::BackToValueType => {}
+                ManualDraftOutcome::Completed => return Ok(()),
+            }
+        }
+    }
+
+    /// Collects, reviews, and conditionally saves one manual Credential Draft.
+    fn add_manual_credential(
+        &mut self,
+        path: &Path,
+        vault: &mut Vault,
+        draft: &mut CredentialDraft,
+    ) -> Result<ManualDraftOutcome, AppError> {
+        let mut step = ManualDraftStep::Key;
+
+        loop {
+            match step {
+                ManualDraftStep::Key => {
+                    match self.interaction.input_with_default("Key", &draft.key)? {
+                        InteractionResult::Value(key) => {
+                            draft.key = key;
+                            step = ManualDraftStep::Name;
+                        }
+                        InteractionResult::Back => {
+                            return Ok(ManualDraftOutcome::BackToValueType);
+                        }
+                        InteractionResult::Cancel => {
+                            return Ok(ManualDraftOutcome::Completed);
+                        }
+                    }
+                }
+                ManualDraftStep::Name => {
+                    match self.interaction.input_with_default("Name", &draft.name)? {
+                        InteractionResult::Value(name) => {
+                            draft.name = name;
+                            step = ManualDraftStep::Value;
+                        }
+                        InteractionResult::Back => step = ManualDraftStep::Key,
+                        InteractionResult::Cancel => {
+                            return Ok(ManualDraftOutcome::Completed);
+                        }
+                    }
+                }
+                ManualDraftStep::Value => match self
+                    .interaction
+                    .password_with_default("Value", &draft.value)?
+                {
+                    InteractionResult::Value(value) => {
+                        draft.value = value;
+                        step = ManualDraftStep::Review;
+                    }
+                    InteractionResult::Back => step = ManualDraftStep::Name,
+                    InteractionResult::Cancel => {
+                        return Ok(ManualDraftOutcome::Completed);
+                    }
+                },
+                ManualDraftStep::Review => {
+                    self.interaction.message(&format!(
+                        "Key: {}\nName: {}\nValue: [REDACTED]",
+                        draft.key, draft.name
+                    ))?;
+                    let choice = self
+                        .interaction
+                        .choose("Review", &["Save", "Back", "Cancel"])?;
+                    match choice {
+                        InteractionResult::Value(0) => {
+                            let credential = Credential::new(
+                                draft.key.clone(),
+                                draft.name.clone(),
+                                draft.value.clone(),
+                            );
+                            if vault.find_credential(credential.key()).is_some() {
+                                self.interaction
+                                    .message("A Credential entry with that Key already exists.")?;
+                                let duplicate_choice = self
+                                    .interaction
+                                    .choose("Duplicate Key", &["Overwrite", "Back"])?;
+                                match duplicate_choice {
+                                    InteractionResult::Value(0) => {}
+                                    InteractionResult::Value(1) | InteractionResult::Back => {
+                                        step = ManualDraftStep::Review;
+                                        continue;
+                                    }
+                                    InteractionResult::Cancel => {
+                                        return Ok(ManualDraftOutcome::Completed);
+                                    }
+                                    InteractionResult::Value(choice) => {
+                                        return Err(AppError::InvalidChoice {
+                                            prompt: "Duplicate Key",
+                                            choice,
+                                        });
+                                    }
+                                }
+                            }
+
+                            vault.upsert_credential(credential);
+                            Self::persist(path, vault)?;
+                            self.interaction.message("Credential entry saved.")?;
+                            return Ok(ManualDraftOutcome::Completed);
+                        }
+                        InteractionResult::Value(1) | InteractionResult::Back => {
+                            step = ManualDraftStep::Value;
+                        }
+                        InteractionResult::Value(2) | InteractionResult::Cancel => {
+                            return Ok(ManualDraftOutcome::Completed);
+                        }
+                        InteractionResult::Value(choice) => {
+                            return Err(AppError::InvalidChoice {
+                                prompt: "Review",
+                                choice,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collects one Generated-value Credential and persists it after duplicate handling.
+    fn add_generated_credential(&mut self, path: &Path, vault: &mut Vault) -> Result<(), AppError> {
         let key = match self.interaction.input("Key")? {
             InteractionResult::Value(key) => key,
             InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
@@ -488,16 +664,9 @@ impl<I: Interaction> App<I> {
             InteractionResult::Value(name) => name,
             InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
         };
-        let value = if use_generated_value {
-            match self.generated_value()? {
-                Some(value) => value,
-                None => return Ok(()),
-            }
-        } else {
-            match self.interaction.password("Value")? {
-                InteractionResult::Value(value) => value,
-                InteractionResult::Back | InteractionResult::Cancel => return Ok(()),
-            }
+        let value = match self.generated_value()? {
+            Some(value) => value,
+            None => return Ok(()),
         };
         let credential = Credential::new(key, name, value);
 
