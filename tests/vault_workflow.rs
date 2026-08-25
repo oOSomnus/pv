@@ -161,7 +161,7 @@ fn init_then_open_completes_the_empty_vault_lifecycle() {
     let path = directory.path().join("lifecycle.vault");
     let password = "lifecycle password";
     let mut app = App::new(
-        ScriptedInteraction::with_passwords([password, password, password]).with_choices([2]),
+        ScriptedInteraction::with_passwords([password, password, password]).with_choices([3]),
     );
 
     app.init(&path).expect("initialization should succeed");
@@ -256,7 +256,7 @@ fn open_unlocks_a_vault_and_exits_the_empty_vault_menu_without_mutation() {
         .to_bytes()
         .expect("vault should be encoded");
     std::fs::write(&path, &bytes).expect("vault should be written");
-    let mut app = App::new(ScriptedInteraction::with_passwords([password]).with_choices([2]));
+    let mut app = App::new(ScriptedInteraction::with_passwords([password]).with_choices([3]));
 
     let result = app.open(&path).expect("opening should succeed");
 
@@ -279,7 +279,7 @@ fn open_reports_an_incorrect_password_and_allows_a_retry() {
         .expect("vault should be encoded");
     std::fs::write(&path, &bytes).expect("vault should be written");
     let interaction =
-        ScriptedInteraction::with_passwords(["wrong password", password]).with_choices([0, 2]);
+        ScriptedInteraction::with_passwords(["wrong password", password]).with_choices([0, 3]);
     let messages = interaction.message_log();
     let mut app = App::new(interaction);
 
@@ -422,7 +422,7 @@ fn manual_add_is_persisted_and_retrievable_after_reopening() {
 
     let add_interaction = ScriptedInteraction::with_passwords([master_password, "secret value"])
         .with_inputs(["  YouTube  ", "alice"])
-        .with_choices([0, 0, 2]);
+        .with_choices([0, 0, 3]);
     let password_prompts = add_interaction.password_prompt_log();
     let input_prompts = add_interaction.input_prompt_log();
     let mut add_app = App::new(add_interaction);
@@ -445,7 +445,7 @@ fn manual_add_is_persisted_and_retrievable_after_reopening() {
 
     let get_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube"])
-        .with_choices([1, 2]);
+        .with_choices([1, 3]);
     let messages = get_interaction.message_log();
     let mut get_app = App::new(get_interaction);
 
@@ -474,7 +474,7 @@ fn generated_add_is_persisted_and_retrievable_after_reopening() {
 
     let add_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube", "alice", ""])
-        .with_choices([0, 1, 0, 0, 0, 2]);
+        .with_choices([0, 1, 0, 0, 0, 3]);
     let messages = add_interaction.message_log();
     let mut add_app = App::new(add_interaction);
 
@@ -514,7 +514,7 @@ fn generated_add_is_persisted_and_retrievable_after_reopening() {
 
     let get_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["YOUTUBE"])
-        .with_choices([1, 2]);
+        .with_choices([1, 3]);
     let get_messages = get_interaction.message_log();
     let mut get_app = App::new(get_interaction);
 
@@ -545,7 +545,7 @@ fn generated_add_retries_invalid_lengths_and_can_disable_optional_classes() {
 
     let add_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube", "alice", "9", "not a number", "10"])
-        .with_choices([0, 1, 1, 1, 0, 2]);
+        .with_choices([0, 1, 1, 1, 0, 3]);
     let messages = add_interaction.message_log();
     let mut app = App::new(add_interaction);
 
@@ -590,7 +590,7 @@ fn generated_add_can_regenerate_before_confirming() {
 
     let add_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube", "alice", "10"])
-        .with_choices([0, 1, 1, 1, 1, 0, 2]);
+        .with_choices([0, 1, 1, 1, 1, 0, 3]);
     let messages = add_interaction.message_log();
     let mut app = App::new(add_interaction);
 
@@ -634,7 +634,7 @@ fn generated_add_can_be_cancelled_without_mutating_the_vault() {
     let mut app = App::new(
         ScriptedInteraction::with_passwords([master_password])
             .with_inputs(["youtube", "alice", "10"])
-            .with_choices([0, 1, 1, 1, 2, 2]),
+            .with_choices([0, 1, 1, 1, 2, 3]),
     );
 
     app.open(&path)
@@ -662,7 +662,7 @@ fn generated_duplicate_can_be_cancelled_or_overwritten() {
     let mut original_app = App::new(
         ScriptedInteraction::with_passwords([master_password, "original secret"])
             .with_inputs(["YouTube", "original name"])
-            .with_choices([0, 0, 2]),
+            .with_choices([0, 0, 3]),
     );
     original_app
         .open(&path)
@@ -672,7 +672,7 @@ fn generated_duplicate_can_be_cancelled_or_overwritten() {
     let mut cancel_app = App::new(
         ScriptedInteraction::with_passwords([master_password])
             .with_inputs([" youtube ", "discarded name", "10"])
-            .with_choices([0, 1, 1, 1, 0, 1, 2]),
+            .with_choices([0, 1, 1, 1, 0, 1, 3]),
     );
     cancel_app
         .open(&path)
@@ -684,7 +684,7 @@ fn generated_duplicate_can_be_cancelled_or_overwritten() {
 
     let overwrite_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["YOUTUBE", "generated name", "10"])
-        .with_choices([0, 1, 1, 1, 0, 0, 2]);
+        .with_choices([0, 1, 1, 1, 0, 0, 3]);
     let overwrite_messages = overwrite_interaction.message_log();
     let mut overwrite_app = App::new(overwrite_interaction);
     overwrite_app
@@ -700,7 +700,7 @@ fn generated_duplicate_can_be_cancelled_or_overwritten() {
 
     let get_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube"])
-        .with_choices([1, 2]);
+        .with_choices([1, 3]);
     let get_messages = get_interaction.message_log();
     let mut get_app = App::new(get_interaction);
     get_app
@@ -737,7 +737,7 @@ fn duplicate_normalized_key_overwrites_name_and_value() {
                 "second name",
                 "YOUTUBE",
             ])
-            .with_choices([0, 0, 0, 0, 0, 2]);
+            .with_choices([0, 0, 0, 0, 0, 3]);
     let duplicate_messages = add_interaction.message_log();
     let mut add_app = App::new(add_interaction);
 
@@ -752,7 +752,7 @@ fn duplicate_normalized_key_overwrites_name_and_value() {
 
     let get_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["YOUTUBE"])
-        .with_choices([1, 2]);
+        .with_choices([1, 3]);
     let messages = get_interaction.message_log();
     let mut get_app = App::new(get_interaction);
 
@@ -782,7 +782,7 @@ fn duplicate_add_can_be_cancelled_without_mutating_the_vault() {
     let mut add_app = App::new(
         ScriptedInteraction::with_passwords([master_password, "original secret"])
             .with_inputs(["YouTube", "original name"])
-            .with_choices([0, 0, 2]),
+            .with_choices([0, 0, 3]),
     );
     add_app
         .open(&path)
@@ -792,7 +792,7 @@ fn duplicate_add_can_be_cancelled_without_mutating_the_vault() {
     let mut cancel_app = App::new(
         ScriptedInteraction::with_passwords([master_password, "discarded secret"])
             .with_inputs([" youtube ", "discarded name"])
-            .with_choices([0, 0, 1, 2]),
+            .with_choices([0, 0, 1, 3]),
     );
 
     cancel_app
@@ -821,7 +821,7 @@ fn get_can_be_cancelled_without_mutating_the_vault() {
 
     let interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["missing key"])
-        .with_choices([1, 1, 2]);
+        .with_choices([1, 1, 3]);
     let messages = interaction.message_log();
     let mut app = App::new(interaction);
 
@@ -857,7 +857,7 @@ fn get_fuzzy_suggestions_are_ranked_and_limited_to_three() {
 
     let interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube"])
-        .with_choices([1, 1, 2]);
+        .with_choices([1, 1, 3]);
     let choice_options = interaction.choice_options_log();
     let messages = interaction.message_log();
     let mut app = App::new(interaction);
@@ -895,7 +895,7 @@ fn get_fuzzy_suggestions_can_be_cancelled_without_mutation() {
 
     let interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtub"])
-        .with_choices([1, 1, 2]);
+        .with_choices([1, 1, 3]);
     let choice_options = interaction.choice_options_log();
     let messages = interaction.message_log();
     let mut app = App::new(interaction);
@@ -928,7 +928,7 @@ fn get_without_useful_candidates_can_retry() {
 
     let interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["unrelated", "youtub"])
-        .with_choices([1, 0, 0, 2]);
+        .with_choices([1, 0, 0, 3]);
     let choice_options = interaction.choice_options_log();
     let messages = interaction.message_log();
     let mut app = App::new(interaction);
@@ -941,6 +941,228 @@ fn get_without_useful_candidates_can_retry() {
     assert_eq!(
         messages.borrow().last().map(String::as_str),
         Some("Key: youtube\nName: alice\nValue: secret value")
+    );
+}
+
+/// Verifies that an exact normalized Key can be removed and remains absent after reopening.
+#[test]
+fn remove_exact_key_is_confirmed_persisted_and_absent_after_reopen() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-exact.vault");
+    let master_password = "remove exact password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("YouTube", "alice", "secret value")],
+    );
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs([" youtube "])
+        .with_choices([2, 0, 0, 3]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("confirmed exact removal should succeed");
+
+    assert_eq!(messages.borrow().as_slice(), ["Key: YouTube\nName: alice"]);
+    assert!(
+        !messages
+            .borrow()
+            .iter()
+            .any(|message| message.contains("secret value"))
+    );
+
+    let reopen_interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube"])
+        .with_choices([1, 1, 3]);
+    let reopen_messages = reopen_interaction.message_log();
+    let mut reopen_app = App::new(reopen_interaction);
+
+    reopen_app
+        .open(&path)
+        .expect("the reopened Vault should be usable");
+
+    assert_eq!(
+        reopen_messages.borrow().as_slice(),
+        ["Credential entry not found."]
+    );
+}
+
+/// Verifies that fuzzy removal resolves the selected candidate without exposing its Value.
+#[test]
+fn remove_can_select_a_fuzzy_candidate_before_confirming() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-fuzzy.vault");
+    let master_password = "remove fuzzy password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [
+            Credential::new("youtube", "alice", "secret value"),
+            Credential::new("youtube-help", "support", "help value"),
+        ],
+    );
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtub"])
+        .with_choices([2, 0, 0, 0, 3]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("confirmed fuzzy removal should succeed");
+
+    assert_eq!(
+        choice_options.borrow()[1],
+        ["youtube", "youtube-help", "Cancel"]
+    );
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Credential entry not found.", "Key: youtube\nName: alice"]
+    );
+    assert!(
+        !messages
+            .borrow()
+            .iter()
+            .any(|message| message.contains("secret value"))
+    );
+
+    let reopened_bytes = std::fs::read(&path).expect("removed Vault should be readable");
+    let reopened_vault = Vault::unlock(&reopened_bytes, master_password)
+        .expect("the fuzzy removal should be persisted");
+    assert!(reopened_vault.find_credential("youtube").is_none());
+    assert!(reopened_vault.find_credential("youtube-help").is_some());
+}
+
+/// Verifies that cancelling fuzzy candidate selection leaves the Vault unchanged.
+#[test]
+fn remove_fuzzy_selection_can_be_cancelled_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-fuzzy-cancel.vault");
+    let master_password = "remove fuzzy cancellation password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtub"])
+        .with_choices([2, 1, 3]);
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("cancelling fuzzy removal should return to the menu");
+
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Credential entry not found."]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that a query without fuzzy candidates can be cancelled without mutation.
+#[test]
+fn remove_without_candidates_can_be_cancelled_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-missing.vault");
+    let master_password = "remove missing password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["unrelated"])
+        .with_choices([2, 1, 3]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("cancelling a missing removal should return to the menu");
+
+    assert_eq!(choice_options.borrow()[1], ["Retry", "Cancel"]);
+    assert_eq!(
+        messages.borrow().as_slice(),
+        ["Credential entry not found."]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that rejecting the first removal confirmation leaves the Vault unchanged.
+#[test]
+fn remove_first_confirmation_can_be_rejected_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-first-confirmation.vault");
+    let master_password = "remove first confirmation password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube"])
+        .with_choices([2, 1, 3]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("rejecting the first removal confirmation should be safe");
+
+    assert_eq!(messages.borrow().as_slice(), ["Key: youtube\nName: alice"]);
+    assert_eq!(choice_options.borrow()[1], ["Confirm", "Cancel"]);
+    assert_eq!(choice_options.borrow().len(), 3);
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
+    );
+}
+
+/// Verifies that rejecting the second removal confirmation leaves the Vault unchanged.
+#[test]
+fn remove_second_confirmation_can_be_rejected_without_mutation() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("remove-second-confirmation.vault");
+    let master_password = "remove second confirmation password";
+    write_vault_with_credentials(
+        &path,
+        master_password,
+        [Credential::new("youtube", "alice", "secret value")],
+    );
+    let bytes_before_cancel = std::fs::read(&path).expect("vault should be readable");
+
+    let interaction = ScriptedInteraction::with_passwords([master_password])
+        .with_inputs(["youtube"])
+        .with_choices([2, 0, 1, 3]);
+    let choice_options = interaction.choice_options_log();
+    let messages = interaction.message_log();
+    let mut app = App::new(interaction);
+
+    app.open(&path)
+        .expect("rejecting the second removal confirmation should be safe");
+
+    assert_eq!(messages.borrow().as_slice(), ["Key: youtube\nName: alice"]);
+    assert_eq!(choice_options.borrow()[1], ["Confirm", "Cancel"]);
+    assert_eq!(choice_options.borrow()[2], ["Delete", "Cancel"]);
+    assert_eq!(
+        std::fs::read(&path).expect("vault should remain readable"),
+        bytes_before_cancel
     );
 }
 

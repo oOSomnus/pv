@@ -312,14 +312,107 @@ impl<I: Interaction> App<I> {
     /// Runs the credential menu for an already unlocked Vault.
     fn run_open_session(&mut self, path: &Path, vault: &mut Vault) -> Result<OpenResult, AppError> {
         loop {
-            let choice = self.interaction.choose("Vault", &["Add", "Get", "Exit"])?;
+            let choice = self
+                .interaction
+                .choose("Vault", &["Add", "Get", "Remove", "Exit"])?;
             match choice {
                 0 => self.add_credential(path, vault)?,
                 1 => self.get_credential(vault)?,
-                2 => return Ok(OpenResult::Exited),
+                2 => self.remove_credential(path, vault)?,
+                3 => return Ok(OpenResult::Exited),
                 choice => {
                     return Err(AppError::InvalidChoice {
                         prompt: "Vault",
+                        choice,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Resolves an exact normalized Key or fuzzy candidate, confirms removal twice, and persists the changed Vault.
+    fn remove_credential(&mut self, path: &Path, vault: &mut Vault) -> Result<(), AppError> {
+        let Some(credential) = self.resolve_credential(vault)? else {
+            return Ok(());
+        };
+        let key = credential.key().to_owned();
+        let name = credential.name().to_owned();
+
+        self.interaction
+            .message(&format!("Key: {key}\nName: {name}"))?;
+        if !self.confirm_removal("Remove Credential entry", "Confirm")? {
+            return Ok(());
+        }
+        if !self.confirm_removal("Confirm deletion", "Delete")? {
+            return Ok(());
+        }
+
+        vault.remove_credential(&key);
+        Self::persist(path, vault)
+    }
+
+    /// Presents a positive confirmation and returns `false` for the cancellation choice.
+    fn confirm_removal(
+        &mut self,
+        prompt: &'static str,
+        positive_choice: &'static str,
+    ) -> Result<bool, AppError> {
+        let choice = self
+            .interaction
+            .choose(prompt, &[positive_choice, "Cancel"])?;
+        match choice {
+            0 => Ok(true),
+            1 => Ok(false),
+            choice => Err(AppError::InvalidChoice { prompt, choice }),
+        }
+    }
+
+    /// Resolves an exact or fuzzy Key, returning `None` when lookup is cancelled.
+    fn resolve_credential<'vault>(
+        &mut self,
+        vault: &'vault Vault,
+    ) -> Result<Option<&'vault Credential>, AppError> {
+        loop {
+            let query = self.interaction.input("Key")?;
+            if let Some(credential) = vault.find_credential(&query) {
+                return Ok(Some(credential));
+            }
+
+            self.interaction.message("Credential entry not found.")?;
+            let suggestions = vault.find_credential_suggestions(&query);
+            if !suggestions.is_empty() {
+                let mut options: Vec<String> = suggestions
+                    .iter()
+                    .map(|credential| credential.key().to_owned())
+                    .collect();
+                options.push("Cancel".to_owned());
+                let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
+                let choice = self
+                    .interaction
+                    .choose("Credential suggestions", &option_references)?;
+                match choice {
+                    choice if choice < suggestions.len() => {
+                        return Ok(Some(suggestions[choice]));
+                    }
+                    choice if choice == suggestions.len() => return Ok(None),
+                    choice => {
+                        return Err(AppError::InvalidChoice {
+                            prompt: "Credential suggestions",
+                            choice,
+                        });
+                    }
+                }
+            }
+
+            let choice = self
+                .interaction
+                .choose("Credential not found", &["Retry", "Cancel"])?;
+            match choice {
+                0 => {}
+                1 => return Ok(None),
+                choice => {
+                    return Err(AppError::InvalidChoice {
+                        prompt: "Credential not found",
                         choice,
                     });
                 }
@@ -457,54 +550,10 @@ impl<I: Interaction> App<I> {
 
     /// Looks up and displays one Credential, offering explicit fuzzy matches when needed.
     fn get_credential(&mut self, vault: &Vault) -> Result<(), AppError> {
-        loop {
-            let query = self.interaction.input("Key")?;
-            if let Some(credential) = vault.find_credential(&query) {
-                self.display_credential(credential)?;
-                return Ok(());
-            }
-
-            self.interaction.message("Credential entry not found.")?;
-            let suggestions = vault.find_credential_suggestions(&query);
-            if !suggestions.is_empty() {
-                let mut options: Vec<String> = suggestions
-                    .iter()
-                    .map(|credential| credential.key().to_owned())
-                    .collect();
-                options.push("Cancel".to_owned());
-                let option_references: Vec<&str> = options.iter().map(String::as_str).collect();
-                let choice = self
-                    .interaction
-                    .choose("Credential suggestions", &option_references)?;
-                match choice {
-                    choice if choice < suggestions.len() => {
-                        self.display_credential(suggestions[choice])?;
-                        return Ok(());
-                    }
-                    choice if choice == suggestions.len() => return Ok(()),
-                    choice => {
-                        return Err(AppError::InvalidChoice {
-                            prompt: "Credential suggestions",
-                            choice,
-                        });
-                    }
-                }
-            }
-
-            let choice = self
-                .interaction
-                .choose("Credential not found", &["Retry", "Cancel"])?;
-            match choice {
-                0 => {}
-                1 => return Ok(()),
-                choice => {
-                    return Err(AppError::InvalidChoice {
-                        prompt: "Credential not found",
-                        choice,
-                    });
-                }
-            }
+        if let Some(credential) = self.resolve_credential(vault)? {
+            self.display_credential(credential)?;
         }
+        Ok(())
     }
 
     /// Displays a Credential's Key, Name, and Value through the interaction adapter.
