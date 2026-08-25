@@ -76,6 +76,19 @@ pub trait Interaction {
         options: &[&str],
     ) -> Result<InteractionResult<usize>, InteractionError>;
 
+    /// Presents a menu with `default` as the initially selected zero-based option.
+    ///
+    /// Adapters that do not support an initial selection fall back to [`Self::choose`].
+    fn choose_with_default(
+        &mut self,
+        prompt: &str,
+        options: &[&str],
+        default: usize,
+    ) -> Result<InteractionResult<usize>, InteractionError> {
+        let _ = default;
+        self.choose(prompt, options)
+    }
+
     /// Shows a message and menu together, preserving the page while the user chooses an action.
     ///
     /// Adapters without a combined page render the message before presenting the menu.
@@ -162,6 +175,25 @@ impl Interaction for DialoguerInteraction {
             .with_prompt(prompt)
             .items(options)
             .default(0)
+            .interact()
+            .map(InteractionResult::Value)
+            .map_err(|error| InteractionError::new(error.to_string()))
+    }
+
+    /// Displays a dialoguer selection menu with the requested initial option.
+    fn choose_with_default(
+        &mut self,
+        prompt: &str,
+        options: &[&str],
+        default: usize,
+    ) -> Result<InteractionResult<usize>, InteractionError> {
+        if options.is_empty() {
+            return Err(InteractionError::new("no menu options are available"));
+        }
+        Select::new()
+            .with_prompt(prompt)
+            .items(options)
+            .default(default)
             .interact()
             .map(InteractionResult::Value)
             .map_err(|error| InteractionError::new(error.to_string()))
@@ -427,11 +459,6 @@ impl RemovalCandidate {
             name: credential.name().to_owned(),
         }
     }
-}
-
-/// Masks a secret with one bullet for each Unicode scalar value it contains.
-fn mask_value(value: &str) -> String {
-    "•".repeat(value.chars().count())
 }
 
 /// Identifies the Remove step to revisit when the user presses Back.
@@ -1030,27 +1057,27 @@ impl<I: Interaction> App<I> {
         }
     }
 
-    /// Presents a Generated value setting with the current value selected by default.
+    /// Presents a Generated value setting with Enabled listed before Disabled.
     fn choose_generated_toggle(
         &mut self,
         prompt: &'static str,
         enabled: bool,
     ) -> Result<InteractionResult<bool>, AppError> {
-        let options = if enabled {
-            ["Enabled", "Disabled"]
-        } else {
-            ["Disabled", "Enabled"]
-        };
-        match self.interaction.choose(prompt, &options)? {
-            InteractionResult::Value(0) => Ok(InteractionResult::Value(enabled)),
-            InteractionResult::Value(1) => Ok(InteractionResult::Value(!enabled)),
+        let options = ["Enabled", "Disabled"];
+        let default = usize::from(!enabled);
+        match self
+            .interaction
+            .choose_with_default(prompt, &options, default)?
+        {
+            InteractionResult::Value(0) => Ok(InteractionResult::Value(true)),
+            InteractionResult::Value(1) => Ok(InteractionResult::Value(false)),
             InteractionResult::Back => Ok(InteractionResult::Back),
             InteractionResult::Cancel => Ok(InteractionResult::Cancel),
             InteractionResult::Value(choice) => Err(AppError::InvalidChoice { prompt, choice }),
         }
     }
 
-    /// Presents a masked Generated value candidate and returns only an explicitly confirmed Value.
+    /// Presents a Generated value candidate and returns only an explicitly confirmed Value.
     fn generated_value_candidate(
         &mut self,
         draft: &mut CredentialDraft,
@@ -1063,7 +1090,7 @@ impl<I: Interaction> App<I> {
 
         loop {
             draft.generated_candidate = Some(candidate.clone());
-            let message = format!("Generated value candidate: {}", mask_value(&candidate));
+            let message = format!("Generated value candidate: {candidate}");
             let choice = self.interaction.choose_page(
                 "Generated value",
                 &message,

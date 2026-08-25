@@ -181,6 +181,16 @@ impl Interaction for ScriptedInteraction {
     }
 }
 
+/// Asserts that a Generated value candidate is shown as a value rather than a mask.
+fn assert_visible_generated_candidate(message: &str, expected_length: usize) {
+    let candidate = message
+        .strip_prefix("Generated value candidate: ")
+        .expect("the message should identify a Generated value candidate");
+    assert_eq!(candidate.chars().count(), expected_length);
+    assert!(!candidate.is_empty());
+    assert!(candidate.chars().all(|character| character != '•'));
+}
+
 /// Writes an encrypted Vault fixture containing the supplied Credential entries.
 fn write_vault_with_credentials(
     path: &Path,
@@ -653,9 +663,9 @@ fn manual_add_can_be_cancelled_without_mutating_the_vault() {
     assert!(vault.find_credential("youtube").is_none());
 }
 
-/// Verifies that the Random Value path uses defaults, masks the candidate, and saves through Review.
+/// Verifies that the Random Value path uses defaults, shows the candidate, and saves through Review.
 #[test]
-fn generated_value_path_uses_defaults_masks_candidate_and_saves_through_review() {
+fn generated_value_path_uses_defaults_shows_candidate_and_saves_through_review() {
     let directory = tempdir().expect("temporary directory should be created");
     let path = directory.path().join("random-defaults.vault");
     let master_password = "random defaults master password";
@@ -668,7 +678,7 @@ fn generated_value_path_uses_defaults_masks_candidate_and_saves_through_review()
 
     let interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube", "alice", ""])
-        .with_choices([0, 1, 0, 0, 0, 0, 3]);
+        .with_choices([0, 1, 0, 1, 0, 0, 3]);
     let messages = interaction.message_log();
     let choice_options = interaction.choice_options_log();
     let mut app = App::new(interaction);
@@ -682,35 +692,27 @@ fn generated_value_path_uses_defaults_masks_candidate_and_saves_through_review()
         .find(|message| message.starts_with("Generated value candidate: "))
         .cloned()
         .expect("the candidate page should be displayed");
+    assert_visible_generated_candidate(&candidate_message, 20);
+    let message_log = messages.borrow();
+    assert_eq!(message_log.len(), 3);
     assert_eq!(
-        candidate_message,
-        "Generated value candidate: ••••••••••••••••••••"
+        message_log[1],
+        "Key: youtube\nName: alice\nValue source: Random\nValue: [REDACTED]"
     );
-    assert_eq!(
-        messages.borrow().as_slice(),
-        [
-            "Generated value candidate: ••••••••••••••••••••",
-            "Key: youtube\nName: alice\nValue source: Random\nValue: [REDACTED]",
-            "Credential entry saved."
-        ]
-    );
+    assert_eq!(message_log[2], "Credential entry saved.");
     assert!(
         choice_options
             .borrow()
             .iter()
             .any(|options| options == &["Manual".to_owned(), "Random".to_owned()])
     );
-    assert!(
+    assert_eq!(
         choice_options
             .borrow()
             .iter()
-            .any(|options| options == &["Enabled".to_owned(), "Disabled".to_owned()])
-    );
-    assert!(
-        choice_options
-            .borrow()
-            .iter()
-            .any(|options| options == &["Disabled".to_owned(), "Enabled".to_owned()])
+            .filter(|options| options == &&["Enabled".to_owned(), "Disabled".to_owned()])
+            .count(),
+        2
     );
     assert!(choice_options.borrow().iter().any(|options| {
         options
@@ -756,11 +758,11 @@ fn generated_value_path_uses_defaults_masks_candidate_and_saves_through_review()
             .chars()
             .all(|character| { character.is_ascii_alphanumeric() })
     );
-    assert!(
-        !messages
-            .borrow()
-            .iter()
-            .any(|message| message.contains(&saved_value))
+    assert_eq!(
+        saved_value,
+        candidate_message
+            .strip_prefix("Generated value candidate: ")
+            .expect("the candidate message should expose the generated value")
     );
 }
 
@@ -779,7 +781,7 @@ fn generated_value_review_shows_the_value_source() {
 
     let interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube", "alice", ""])
-        .with_choices([0, 1, 0, 0, 0, 0, 3]);
+        .with_choices([0, 1, 0, 1, 0, 0, 3]);
     let messages = interaction.message_log();
     let mut app = App::new(interaction);
 
@@ -816,7 +818,7 @@ fn generated_value_back_preserves_settings_when_reentering_random() {
             InteractionResult::Value(0),
             InteractionResult::Value(1),
             InteractionResult::Value(0),
-            InteractionResult::Value(0),
+            InteractionResult::Value(1),
             InteractionResult::Value(2),
             InteractionResult::Back,
             InteractionResult::Back,
@@ -839,13 +841,10 @@ fn generated_value_back_preserves_settings_when_reentering_random() {
         .filter(|message| message.starts_with("Generated value candidate: "))
         .cloned()
         .collect();
-    assert_eq!(
-        candidates,
-        [
-            "Generated value candidate: ••••••••••",
-            "Generated value candidate: ••••••••••",
-        ]
-    );
+    assert_eq!(candidates.len(), 2);
+    for candidate in &candidates {
+        assert_visible_generated_candidate(candidate, 10);
+    }
 }
 
 /// Verifies that invalid Generated value lengths are retried before applying class options.
@@ -863,7 +862,7 @@ fn generated_value_add_retries_invalid_lengths_and_honors_optional_classes() {
 
     let add_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube", "alice", "7", "not a number", "8"])
-        .with_choices([0, 1, 1, 1, 0, 0, 3]);
+        .with_choices([0, 1, 1, 0, 0, 0, 3]);
     let messages = add_interaction.message_log();
     let mut app = App::new(add_interaction);
 
@@ -884,8 +883,8 @@ fn generated_value_add_retries_invalid_lengths_and_honors_optional_classes() {
     let candidate = messages
         .iter()
         .find(|message| message.starts_with("Generated value candidate: "))
-        .expect("the masked candidate should be shown");
-    assert_eq!(candidate, "Generated value candidate: ••••••••");
+        .expect("the visible candidate should be shown");
+    assert_visible_generated_candidate(candidate, 8);
     drop(messages);
 
     let get_interaction = ScriptedInteraction::with_passwords([master_password])
@@ -923,7 +922,7 @@ fn generated_value_add_retries_invalid_lengths_and_honors_optional_classes() {
     }));
 }
 
-/// Verifies that Refresh creates another masked candidate without leaving the candidate page.
+/// Verifies that Refresh creates another visible candidate without leaving the candidate page.
 #[test]
 fn generated_value_add_can_refresh_before_confirming() {
     let directory = tempdir().expect("temporary directory should be created");
@@ -938,7 +937,7 @@ fn generated_value_add_can_refresh_before_confirming() {
 
     let add_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube", "alice", "10"])
-        .with_choices([0, 1, 0, 0, 1, 0, 0, 3]);
+        .with_choices([0, 1, 0, 1, 1, 0, 0, 3]);
     let messages = add_interaction.message_log();
     let mut app = App::new(add_interaction);
 
@@ -951,13 +950,10 @@ fn generated_value_add_can_refresh_before_confirming() {
         .filter(|message| message.starts_with("Generated value candidate: "))
         .cloned()
         .collect();
-    assert_eq!(
-        candidates,
-        [
-            "Generated value candidate: ••••••••••",
-            "Generated value candidate: ••••••••••"
-        ]
-    );
+    assert_eq!(candidates.len(), 2);
+    for candidate in &candidates {
+        assert_visible_generated_candidate(candidate, 10);
+    }
 }
 
 /// Verifies that Back climbs from the candidate through settings to the Value step without losing the Draft.
@@ -985,7 +981,7 @@ fn generated_value_back_returns_to_the_value_step_and_preserves_the_draft() {
             InteractionResult::Value(0),
             InteractionResult::Value(1),
             InteractionResult::Value(0),
-            InteractionResult::Value(0),
+            InteractionResult::Value(1),
             InteractionResult::Value(1),
             InteractionResult::Value(2),
             InteractionResult::Back,
@@ -1002,22 +998,22 @@ fn generated_value_back_returns_to_the_value_step_and_preserves_the_draft() {
     app.open(&path)
         .expect("Random Back should return to the Draft and allow a manual Value");
 
+    let message_log = messages.borrow();
+    assert_eq!(message_log.len(), 4);
+    assert_visible_generated_candidate(&message_log[0], 8);
+    assert_visible_generated_candidate(&message_log[1], 8);
     assert_eq!(
-        messages.borrow().as_slice(),
-        [
-            "Generated value candidate: ••••••••",
-            "Generated value candidate: ••••••••",
-            "Key: youtube\nName: alice\nValue source: Manual\nValue: [REDACTED]",
-            "Credential entry saved."
-        ]
+        message_log[2],
+        "Key: youtube\nName: alice\nValue source: Manual\nValue: [REDACTED]"
     );
+    assert_eq!(message_log[3], "Credential entry saved.");
     assert_eq!(
         choice_options
             .borrow()
             .iter()
-            .filter(|options| options == &&["Disabled".to_owned(), "Enabled".to_owned()])
+            .filter(|options| options == &&["Enabled".to_owned(), "Disabled".to_owned()])
             .count(),
-        2
+        4
     );
 
     let get_interaction = ScriptedInteraction::with_passwords([master_password])
@@ -1052,7 +1048,7 @@ fn generated_value_add_can_be_cancelled_without_mutating_the_vault() {
     let mut app = App::new(
         ScriptedInteraction::with_passwords([master_password])
             .with_inputs(["youtube", "alice", "10"])
-            .with_choices([0, 1, 0, 0, 3, 3]),
+            .with_choices([0, 1, 0, 1, 3, 3]),
     );
 
     app.open(&path)
@@ -1081,7 +1077,7 @@ fn generated_value_review_cancel_does_not_persist_the_candidate() {
     let mut app = App::new(
         ScriptedInteraction::with_passwords([master_password])
             .with_inputs(["youtube", "alice", "8"])
-            .with_choices([0, 1, 0, 0, 0, 2, 3]),
+            .with_choices([0, 1, 0, 1, 0, 2, 3]),
     );
     app.open(&path)
         .expect("cancelling Review should return to the menu");
@@ -1118,7 +1114,7 @@ fn generated_value_duplicate_can_be_cancelled_or_overwritten() {
     let mut cancel_app = App::new(
         ScriptedInteraction::with_passwords([master_password])
             .with_inputs([" youtube ", "discarded name", "10"])
-            .with_choices([0, 1, 1, 1, 0, 0, 1, 2, 3]),
+            .with_choices([0, 1, 1, 0, 0, 0, 1, 2, 3]),
     );
     cancel_app
         .open(&path)
@@ -1130,19 +1126,20 @@ fn generated_value_duplicate_can_be_cancelled_or_overwritten() {
 
     let overwrite_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["YOUTUBE", "generated name", "10"])
-        .with_choices([0, 1, 1, 1, 0, 0, 0, 3]);
+        .with_choices([0, 1, 1, 0, 0, 0, 0, 3]);
     let overwrite_messages = overwrite_interaction.message_log();
     let mut overwrite_app = App::new(overwrite_interaction);
     overwrite_app
         .open(&path)
         .expect("overwriting a duplicate Generated value should succeed");
 
-    assert!(
-        overwrite_messages
-            .borrow()
-            .iter()
-            .any(|message| message == "Generated value candidate: ••••••••••")
-    );
+    let overwrite_candidate = overwrite_messages
+        .borrow()
+        .iter()
+        .find(|message| message.starts_with("Generated value candidate: "))
+        .cloned()
+        .expect("the overwritten candidate should be displayed");
+    assert_visible_generated_candidate(&overwrite_candidate, 10);
 
     let get_interaction = ScriptedInteraction::with_passwords([master_password])
         .with_inputs(["youtube"])

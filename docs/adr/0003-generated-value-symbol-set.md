@@ -16,8 +16,8 @@ Generated Values use the exact ASCII Symbol set `!@.-_*` when Symbols are
 enabled. The generator validates lengths from 8 through 100, uses length 20
 with Numbers enabled and Symbols disabled by default, and guarantees at least
 one character from every enabled category while excluding disabled categories.
-The generated candidate remains masked and in memory until the shared Review
-Save decision persists it.
+The generated candidate is shown in the Add flow and remains in memory until
+the shared Review Save decision persists it.
 
 ## Consequences
 
@@ -25,5 +25,7 @@ Save decision persists it.
   guarantees.
 - Generated Values remain compatible with services that reject broader
   punctuation sets.
+- Showing a candidate makes it visible to anyone who can see the terminal;
+  the shared Review page still redacts the stored Value.
 - A Symbol set change would be a compatibility decision and requires updated
   regression coverage; it does not require a Vault format migration.

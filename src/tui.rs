@@ -50,7 +50,7 @@ enum TuiPage {
     Value,
     /// The Generated value settings page.
     GeneratorSettings,
-    /// The masked Generated value candidate page.
+    /// The Generated value candidate page.
     GeneratedValue,
     /// The unsaved Credential review page.
     Review,
@@ -520,6 +520,23 @@ impl TuiInteraction {
         }
     }
 
+    /// Builds a choice page body with its prompt, optional message, and selected option.
+    fn choice_body(prompt: &str, message: &str, options: &[&str], selected: usize) -> Vec<String> {
+        let mut body = vec![prompt.to_owned(), String::new()];
+        if !message.is_empty() {
+            body.extend(message.split('\n').map(str::to_owned));
+            body.push(String::new());
+        }
+        body.extend(options.iter().enumerate().map(|(index, option)| {
+            if index == selected {
+                format!("› {option}")
+            } else {
+                format!("  {option}")
+            }
+        }));
+        body
+    }
+
     /// Reads a keyboard-selected option while keeping a message on the same page.
     ///
     /// Returns an [`InteractionError`] when `options` is empty or terminal rendering/event
@@ -530,27 +547,24 @@ impl TuiInteraction {
         message: &str,
         options: &[&str],
     ) -> Result<InteractionResult<usize>, InteractionError> {
+        self.read_choice_page_with_default(prompt, message, options, 0)
+    }
+
+    /// Reads a keyboard-selected option with a caller-provided initial selection.
+    fn read_choice_page_with_default(
+        &mut self,
+        prompt: &str,
+        message: &str,
+        options: &[&str],
+        default: usize,
+    ) -> Result<InteractionResult<usize>, InteractionError> {
         if options.is_empty() {
             return Err(InteractionError::new("no menu options are available"));
         }
-        let mut selected = 0;
+        let mut selected = default.min(options.len() - 1);
         loop {
             self.enter_page(prompt);
-            let mut body: Vec<String> = if message.is_empty() {
-                Vec::new()
-            } else {
-                message.split('\n').map(str::to_owned).collect()
-            };
-            if !body.is_empty() {
-                body.push(String::new());
-            }
-            body.extend(options.iter().enumerate().map(|(index, option)| {
-                if index == selected {
-                    format!("› {option}")
-                } else {
-                    format!("  {option}")
-                }
-            }));
+            let body = Self::choice_body(prompt, message, options, selected);
             let footer = self.navigation_footer("↑↓ Navigate   Enter Select");
             self.draw(&body, &footer)?;
 
@@ -657,7 +671,17 @@ impl Interaction for TuiInteraction {
         self.read_choice_page(prompt, "", options)
     }
 
-    /// Shows a masked candidate and its actions on one refreshable terminal page.
+    /// Reads a menu selection while initially highlighting `default`.
+    fn choose_with_default(
+        &mut self,
+        prompt: &str,
+        options: &[&str],
+        default: usize,
+    ) -> Result<InteractionResult<usize>, InteractionError> {
+        self.read_choice_page_with_default(prompt, "", options, default)
+    }
+
+    /// Shows a candidate and its actions on one refreshable terminal page.
     fn choose_page(
         &mut self,
         prompt: &str,
@@ -699,4 +723,24 @@ fn is_cancel_key(key: KeyEvent) -> bool {
 /// Truncates a line by characters so it remains inside the terminal width.
 fn trim_to_width(value: &str, width: usize) -> String {
     value.chars().take(width).collect()
+}
+
+/// Verifies that choice pages identify the setting before displaying its options.
+#[cfg(test)]
+mod tests {
+    use super::TuiInteraction;
+
+    /// Verifies that a setting prompt is rendered before its Enabled/Disabled options.
+    #[test]
+    fn choice_body_includes_prompt_before_options() {
+        assert_eq!(
+            TuiInteraction::choice_body("Numbers", "", &["Enabled", "Disabled"], 0),
+            vec![
+                "Numbers".to_owned(),
+                String::new(),
+                "› Enabled".to_owned(),
+                "  Disabled".to_owned(),
+            ]
+        );
+    }
 }
